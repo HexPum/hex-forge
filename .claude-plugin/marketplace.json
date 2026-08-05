@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ClCod",
+  "owner": {
+    "name": "HexPum"
+  },
+  "metadata": {
+    "description": "HexPum's baseline Claude Code setup: shared conventions, safety hooks, and scaffolding for every future repo."
+  },
+  "plugins": [
+    {
+      "name": "clcod-essentials",
+      "source": "./plugins/clcod-essentials",
+      "description": "Dangerous-command guard, repo conventions skill, and a repo-scaffolding subagent.",
+      "version": "0.1.0"
+    }
+  ]
+}

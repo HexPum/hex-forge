@@ -5,9 +5,16 @@
         "source": "github",
         "repo": "ayghri/i-have-adhd"
       }
+    },
+    "ClCod": {
+      "source": {
+        "source": "github",
+        "repo": "HexPum/ClCod"
+      }
     }
   },
   "enabledPlugins": {
-    "i-have-adhd@i-have-adhd": true
+    "i-have-adhd@i-have-adhd": true,
+    "clcod-essentials@ClCod": true
   }
 }
