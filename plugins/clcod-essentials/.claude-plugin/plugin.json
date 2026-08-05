@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "clcod-essentials",
-  "version": "0.1.0",
-  "description": "Baseline Claude Code config for HexPum repos: a dangerous-command guard, shared conventions, and a repo-scaffolding subagent.",
+  "version": "0.2.0",
+  "description": "Baseline Claude Code config for HexPum repos: a dangerous-command guard, agent-reach auto-install, shared conventions, and a repo-scaffolding subagent.",
   "author": {
     "name": "HexPum"
   },

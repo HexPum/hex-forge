@@ -11,8 +11,8 @@
     {
       "name": "clcod-essentials",
       "source": "./plugins/clcod-essentials",
-      "description": "Dangerous-command guard, repo conventions skill, and a repo-scaffolding subagent.",
-      "version": "0.1.0"
+      "description": "Dangerous-command guard, agent-reach auto-install, repo conventions skill, and a repo-scaffolding subagent.",
+      "version": "0.2.0"
     }
   ]
 }

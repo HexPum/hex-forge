@@ -64,6 +64,24 @@ Every new HexPum repo should start with:
 Use the `repo-scaffolder` subagent (bundled in this plugin) to generate this
 baseline in one pass instead of doing it file-by-file.
 
+## agent-reach
+
+A `SessionStart` hook in this plugin keeps the
+[agent-reach](https://github.com/Panniantong/Agent-Reach) skill and CLI
+installed (globally — never into the working repo). Two consequences worth
+knowing:
+
+- Don't hand-run `npx skills add Panniantong/Agent-Reach@agent-reach` inside
+  a repo; that writes `.agents/`, `.claude/skills/`, and `skills-lock.json`
+  into the workspace. The hook already handles it with `--global`.
+- Before using an agent-reach channel, run `agent-reach doctor --json` and
+  check that channel's `active_backend`. It routes to per-platform CLIs it
+  does not install, so most channels are inactive on a fresh machine — say
+  which backend you're using, and don't invent a fallback when one is
+  missing.
+
+Set `CLCOD_SKIP_AGENT_REACH=1` to disable the hook.
+
 ## Efficiency defaults
 
 - Prefer editing existing files over introducing new abstractions/config

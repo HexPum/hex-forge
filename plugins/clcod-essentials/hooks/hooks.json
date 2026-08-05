@@ -11,6 +11,19 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/ensure-agent-reach.sh",
+            "async": true,
+            "timeout": 600,
+            "statusMessage": "Ensuring agent-reach is installed…"
+          }
+        ]
+      }
     ]
   }
 }
