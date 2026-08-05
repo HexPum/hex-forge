@@ -46,3 +46,23 @@ claude plugin install clcod-essentials@ClCod
 
 Everyone who opens that repo with Claude Code then gets the hook, skill,
 and subagent automatically — no per-person setup.
+
+## Also installed: agent-reach
+
+`.agents/skills/agent-reach/` (symlinked into `.claude/skills/agent-reach`)
+is a separate, universal agent skill from
+[Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) —
+routes research/lookup requests ("research X", "search for X", or any
+mention of Twitter, Reddit, GitHub, YouTube, LinkedIn, etc.) to the right
+platform CLI/API. Installed via the [skills.sh](https://skills.sh) CLI, not
+Claude Code's own plugin system, so it's tracked separately from
+`.claude-plugin/`; `skills-lock.json` pins the installed version.
+
+It runs with full agent permissions and can reach live external platforms
+(some need your cookies/login) — that's a real capability, not just repo
+hygiene, so decide per-repo whether you want it rather than assuming every
+ClCod-based repo should have it. To add it elsewhere yourself:
+
+```
+npx skills add Panniantong/Agent-Reach@agent-reach
+```
