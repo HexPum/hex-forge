@@ -1,0 +1,28 @@
+.env.local
+.env
+.env.*
+!.env.example
+.real-money-test-state/
+.sentinel-real-tests/
+# Machine-local runtime state + client config — never committed (they embed
+# absolute paths and local logs). Ignore the whole dirs, not just some files.
+.agent-sentinel/
+.claude/
+research/
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.pyc
+.hermes/
+*.local.md
+.gstack/
+# Event-store runtime artifacts if a stray run creates a store at the repo root
+# (the real store lives in .agent-sentinel/ or the XDG state dir) — never commit.
+/events.sqlite3*
+/events.jsonl
+/events.jsonl.lock
+/events.authoritative
+apps/agentacct/.build/

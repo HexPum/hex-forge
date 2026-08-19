@@ -1,0 +1,10 @@
+[Unit]
+Description=Session Kit, hourly check for provider-exited sessions
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

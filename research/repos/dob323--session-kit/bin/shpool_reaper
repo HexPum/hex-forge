@@ -1,0 +1,1483 @@
+#!/usr/bin/env bash
+# Safe session-kit reaper.
+#
+# The normal report records verified idle empty-shell candidates for confirmed
+# `sp prune`, seven days by default, SESSION_KIT_PRUNE_DAYS otherwise, and the
+# window travels with the list it produces. `--auto-close` is narrower, is now
+# a BACKSTOP (see WHAT --auto-close IS FOR NOW, under the variable block), and
+# may close only a generated, provider-exited terminal after 72 continuous
+# hours of exact proof, plus a shell-less manager phantom on its first complete
+# absence proof. Neither touches a terminal whose record says keep.
+
+set -u
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
+RELEASE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+
+if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
+  REAPER_PLATFORM=$SESSION_KIT_TEST_PLATFORM
+else
+  REAPER_PLATFORM=$(uname -s 2>/dev/null)
+fi
+STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
+# The reaper closes terminals, and /proc is the evidence it closes them on. A
+# fixture root is honoured only inside the isolated test harness; production
+# reads the real process table so no environment variable can dress up a live
+# session as a seven-day corpse.
+if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_PROC_ROOT:-} ]]; then
+  PROC_ROOT=$SESSION_KIT_PROC_ROOT
+else
+  PROC_ROOT=/proc
+fi
+SENTINEL=${SESSION_KIT_REAPER_SENTINEL:-"$HOME/.no_shpool_reaper"}
+MAX_AGE_DAYS=${SESSION_KIT_PRUNE_DAYS:-7}
+SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
+DRY_RUN=${SESSION_KIT_REAPER_DRY_RUN:-0}
+sweep_subagents() {
+  # The operator's off switch stops THIS too. It used to, only because the
+  # sweep sat below the sentinel check on the hourly path; giving the sweep its
+  # own entry point walked the most destructive pass in the kit out from behind
+  # the one file they reach for when something gets closed (lane A F1). The
+  # check lives inside the function now, so it covers every caller by
+  # construction rather than by where the call happens to sit.
+  if [[ -e $SENTINEL ]]; then
+    printf '%s sub-agent sweep disabled by %s\n' "$(timestamp)" "$SENTINEL" >&2
+    return 3
+  fi
+  # Completion means closure (X20): close provider sub-agent worker processes
+  # whose own output transcript has stayed unchanged past the threshold. Runs
+  # first and best-effort -- zombie workers are independent of the shpool
+  # inventory, so a broken guard-live snapshot must not keep them alive, and
+  # a sweep failure must never block the terminal reaper sharing this timer.
+  # On the hourly path this runs after the shpool checks, so a down daemon does
+  # delay it there; the five-minute timer has no such gate, which is where the
+  # independence above is actually delivered (lane A F7).
+  # Linux only, hard: Darwin's generated proc-shaped tree is a one-time
+  # process snapshot. Its mtimes say when snapshot files were written, not
+  # when worker output moved, and it cannot re-read a live PID generation at
+  # delivery time. The transcript supplies the idle evidence directly, but
+  # exact TERM/KILL delivery still requires live procfs (re-derived X20-F1).
+  # Its own switches, on top of the sentinel above:
+  # SESSION_KIT_SUBAGENT_SWEEP=off, a subagent-sweep-off file in the state
+  # directory, or a window of 0 -- set with SESSION_KIT_SUBAGENT_IDLE_MINUTES,
+  # the older SESSION_KIT_SUBAGENT_IDLE_HOURS, or a subagent-sweep-minutes
+  # file in the state directory, which is the only one of the three that
+  # reaches the timer. A window that cannot be read turns the sweep off. The
+  # module docstring enumerates every one of them, and `session-kit doctor`
+  # reports which are active. A dry pass touches nothing, the directory
+  # included.
+  if [[ $REAPER_PLATFORM != Darwin &&
+        -f $RELEASE_DIR/lib/sessionkit_inventory/subagent_sweep.py ]]; then
+    sweep_args=(sweep --proc "$PROC_ROOT" --state-dir "$STATE_DIR")
+    if [[ $DRY_RUN == 1 ]]; then
+      sweep_args+=(--dry-run)
+    else
+      mkdir -p "$STATE_DIR" 2>/dev/null || true
+      chmod 700 "$STATE_DIR" 2>/dev/null || true
+    fi
+    PYTHONPATH="$RELEASE_DIR/lib" \
+      python3 -m sessionkit_inventory.subagent_sweep "${sweep_args[@]}" || true
+  fi
+}
+
+# The backstop window, not the normal one: see WHAT --auto-close IS FOR NOW.
+AUTO_CLOSE_HOURS=${SESSION_KIT_AUTO_CLOSE_HOURS:-72}
+STATUS=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
+INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$RELEASE_DIR/lib/session_inventory.py"}
+DARWIN_PROC_SNAPSHOT=
+DARWIN_DAEMON_PID=
+# Shared holder and exact-shell proof primitives. Sourcing defines functions
+# and paths only; it does not contact a daemon or mutate state.
+# shellcheck source=bin/session_kit_common
+source "$SCRIPT_DIR/session_kit_common"
+
+# WHAT --auto-close IS FOR NOW
+#
+# (This is here rather than in the file header because the header may not grow:
+# tests/test_testing_gates.py sources the first 30 lines to prove PROC_ROOT is
+# chosen there, and one added line cuts that `if` in half.)
+#
+# It is a BACKSTOP, not the way provider-exited terminals normally go
+# (operator ruling, 2026-08-15: a session whose provider exits closes AT ONCE
+# and lands in Closed sessions under its real name). The managed shell closes
+# itself the moment its provider is gone for good, so a row that reaches 72
+# hours means one of three things, and each is a reason to keep this engine
+# rather than retire it:
+#
+#   1. The session was started by an earlier release. A shell sources its
+#      bashrc once, at session start; installing a release does not restart a
+#      live session, so every session already running when the new close
+#      landed keeps the old path for the rest of its life.
+#   2. The close itself failed, an unwritable ledger, a python3 that was
+#      momentarily unavailable. The shell keeps such a session on purpose and
+#      says so; the record and the conversation are both intact, which is
+#      exactly what this engine needs, so it finishes the job three days on.
+#   3. The shell-less phantom class, which the ruling never touched: the
+#      daemon still advertises a session whose shell process is gone, no
+#      picker action can reach it, and only a daemon restart or this pass
+#      clears it. (Stock shpool leaves such a row behind whenever a session
+#      nobody is attached to loses its shell, measured on shpool 0.11.) This
+#      class clears on its first complete pass; the 72-hour window protects
+#      live empty shells and has no safety value once every session process is
+#      proved absent.
+#
+# It cannot cover the fourth case, and must not be widened to. A session whose
+# provider-exit record was never written does not say "provider exited", and a
+# session with no exact conversation has no uuid; reaper.py `_safe_candidate`
+# refuses both. Those stay VISIBLE until a person closes them from the picker,
+# which is the standing rule for a row whose state cannot be proven.
+
+reaper_usage() {
+  cat <<'EOF'
+usage: shpool_reaper [mode]
+
+  (no mode), --candidates          report terminals that meet every close
+                                   predicate, and change nothing
+  --auto-close                     close the candidates that have held every
+                                   predicate for the full quiet period
+  --sweep-subagents                close finished sub-agent workers only, and
+                                   touch no terminal (its own five-minute
+                                   timer; the hourly pass also does this)
+  --verify-candidate <private-json> [guard-json]
+                                   re-prove one candidate against a bound
+                                   guard document (or a fresh one)
+
+Statuses: 0 done, 1 refused or failed, 2 wrong arguments, 3 disabled by its
+sentinel file. `sp help exit-codes` documents them all.
+EOF
+}
+
+MODE=report
+VERIFY_FILE=
+VERIFY_GUARD_FILE=
+case "${1:-}" in
+  -h | --help | help)
+    reaper_usage
+    exit 0
+    ;;
+  ""|--candidates) ;;
+  --auto-close)
+    [[ -z ${2:-} ]] || {
+      reaper_usage >&2
+      exit 2
+    }
+    MODE=auto
+    ;;
+  --sweep-subagents)
+    [[ -z ${2:-} ]] || {
+      reaper_usage >&2
+      exit 2
+    }
+    MODE=sweep
+    ;;
+  --verify-candidate)
+    [[ -n ${2:-} && -z ${4:-} ]] || {
+      reaper_usage >&2
+      exit 2
+    }
+    MODE=verify
+    VERIFY_FILE=$2
+    VERIFY_GUARD_FILE=${3:-}
+    ;;
+  *)
+    reaper_usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z $SHPOOL ]]; then SHPOOL=$(command -v shpool 2>/dev/null || true); fi
+if [[ -z $SHPOOL ]]; then
+  for candidate in "$HOME/.cargo/bin/shpool" /opt/homebrew/bin/shpool /usr/local/bin/shpool; do
+    if [[ -x $candidate ]]; then SHPOOL=$candidate; break; fi
+  done
+fi
+
+timestamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+fail() {
+  printf 'session-kit: %s\n' "$*" >&2
+  exit 1
+}
+
+# One stable, machine-distinguishable line per successful maintenance pass.
+# The timer runs --auto-close, whose successful exits used to bypass the
+# report-mode append at the bottom of this file and leave reaper.log silent.
+# Keep the format version on every line so future readers can distinguish the
+# original unversioned history from this key/value format.
+log_reaper_run() {
+  local run_mode=$1 run_summary=$2
+  [[ $DRY_RUN != 1 ]] || return 0
+  umask 077
+  mkdir -p "$STATE_DIR" || fail "state directory creation"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if ! printf 'schema_version=1 timestamp=%s mode=%s %s\n' \
+    "$(timestamp)" "$run_mode" "$run_summary" >> "$STATE_DIR/reaper.log"; then
+    printf 'session-kit: reaper log write failed; maintenance summary follows\n' >&2
+    return 0
+  fi
+  chmod 600 "$STATE_DIR/reaper.log" 2>/dev/null || true
+}
+
+# The scheduled half of "a copy comes back when its session closes". A close
+# that lands while the worker is still writing keeps the directory on purpose,
+# and without this pass that decision would be permanent. Every copy still goes
+# through the whole work check, so this can only collect what a close would
+# have collected.
+#
+# "Nothing is alive" and "I could not find out what is alive" produce the same
+# empty list, and one of those two means remove every copy. Reading the payload
+# here in shell had no way to tell them apart, so the payload goes to the sweep
+# verb itself, which refuses outright on anything it cannot fully account for
+# and treats only a cleanly-parsed empty list as "none alive". A pass that
+# skipped its work says so, because silence reads exactly like a pass that had
+# nothing to do.
+#
+# Sets `swept` and `swept_kept` for the caller's summary.
+run_worktree_sweep() {
+  local live_json= sweep_output=
+  swept=0
+  swept_kept=0
+  bound_shpool_list "worktree sweep" || return 0
+  live_json=$BOUND_SHPOOL_JSON
+  if sweep_output=$(printf '%s' "$live_json" |
+      python3 "$INVENTORY_CORE" worktree sweep --active-stdin); then
+    swept=$(printf '%s' "$sweep_output" | grep -c '^Removed the ' || true)
+    swept_kept=$(printf '%s' "$sweep_output" | grep -c '^Kept the ' || true)
+    [[ -z $sweep_output ]] || printf '%s' "$sweep_output"
+  else
+    printf 'session-kit: no working copy was collected this pass; the sweep refused.\n'
+  fi
+  return 0
+}
+
+expire_picker_temp_files() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ $REAPER_PLATFORM != Darwin ]] || return 0
+  local expired
+  expired=$(python3 - "$STATE_DIR" "$PROC_ROOT" <<'PY'
+import os
+import re
+import stat
+import sys
+import time
+
+state_raw, proc_raw = sys.argv[1:]
+state = os.path.abspath(state_raw)
+proc = os.path.abspath(proc_raw)
+uid = os.geteuid()
+
+def stale_tui_capture(directory: int, name: str, cutoff_ns: int) -> bool:
+    if re.fullmatch(r"tui-stderr\.[A-Za-z0-9_]{8,16}", name) is None:
+        return False
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        capture = os.open(name, flags, dir_fd=directory)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(capture)
+        capture_root = os.path.join(state, name)
+        if (
+            info.st_uid != uid
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or info.st_mtime_ns > cutoff_ns
+        ):
+            return False
+        for pid_name in os.listdir(proc):
+            if not pid_name.isdigit():
+                continue
+            descriptors = os.path.join(proc, pid_name, "fd")
+            try:
+                descriptor_names = os.listdir(descriptors)
+            except OSError:
+                continue
+            for descriptor_name in descriptor_names:
+                try:
+                    target = os.readlink(os.path.join(descriptors, descriptor_name))
+                except OSError:
+                    continue
+                if target == capture_root or target.startswith(capture_root + os.sep):
+                    return False
+        children = set(os.listdir(capture))
+        if not children.issubset({"tail", "tail.trim", "stream"}):
+            return False
+        for child in children:
+            child_info = os.stat(child, dir_fd=capture, follow_symlinks=False)
+            if child_info.st_uid != uid or stat.S_IMODE(child_info.st_mode) != 0o600:
+                return False
+            if child == "stream":
+                if not stat.S_ISFIFO(child_info.st_mode):
+                    return False
+            elif not stat.S_ISREG(child_info.st_mode) or child_info.st_nlink != 1:
+                return False
+        for child in children:
+            os.unlink(child, dir_fd=capture)
+        os.rmdir(name, dir_fd=directory)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(capture)
+# mktemp writes <label>.json.XXXXXX, suffix AFTER .json. The old
+# <label>.SUFFIX.json form never matched a real file (the inversion leaked
+# every picker temp ever written); both spellings are accepted so any
+# stragglers from older releases are still collected.
+# Every mktemp label the kit writes into this directory. A label absent from
+# this list has no backstop at all: `sp-snapshot` files from 15 days back
+# survived every hourly sweep, and an interrupted account switch left a
+# `account-switch-wait` file no trap knew about.
+pattern = re.compile(
+    r"^(?:(?:login-(?:snapshot|view|projects|projects-state|recovery"
+    r"|live-done|live-pending|live|frame|accounts"
+    # The picker's event subscription writes both of these for as long as it
+    # runs, and a picker that is SIGKILLed leaves them behind with no trap to
+    # unlink them.
+    r"|events-down|events)"
+    r"|picker-proof|sp-guard|sp-snapshot|sp-strict"
+    r"|account-switch-(?:choices|processes|wait|rollback)"
+    r"|watchdog-snapshot|watchdog-repair"
+    r"|revalidate|generation-proof|prune-candidate|project-discovery"
+    r"|provider-proof|bounce-recheck|auto-close-proof)"
+    r"(?:\.json\.[A-Za-z0-9_]{6,16}|\.[A-Za-z0-9_]{6,16}\.json)"
+    # Labels written without a .json part at all. An interrupted account switch
+    # leaves one of these, and no trap knows about it.
+    r"|(?:account-switch-(?:choices|processes|wait|rollback)|watchdog-repair"
+    r"|login-projects-state|project-discovery)"
+    r"\.[A-Za-z0-9_]{6,16}"
+    r"|\.inventory\.json\.[A-Za-z0-9_]{6,16})$"
+)
+
+try:
+    proc_names = os.listdir(proc)
+except OSError:
+    raise SystemExit(0)
+
+# A live picker refreshes its private temps every few seconds, so the 24-hour
+# age cutoff below already guarantees no in-use file is touched. The old
+# whole-run abort whenever ANY same-user picker was live made expiry
+# permanently dead on a box that always has a picker open, the leak this
+# collector exists to prevent. Only an unreadable process table still aborts.
+for name in proc_names:
+    if not name.isdigit():
+        continue
+    root = os.path.join(proc, name)
+    try:
+        os.stat(root, follow_symlinks=False)
+    except FileNotFoundError:
+        continue
+    except OSError:
+        raise SystemExit(0)
+
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+flags |= getattr(os, "O_NOFOLLOW", 0)
+try:
+    directory = os.open(state, flags)
+except OSError:
+    raise SystemExit(0)
+
+removed = 0
+try:
+    root_info = os.fstat(directory)
+    if (
+        root_info.st_uid != uid
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise SystemExit(0)
+    cutoff_ns = time.time_ns() - 24 * 60 * 60 * 1_000_000_000
+    for name in os.listdir(directory):
+        if stale_tui_capture(directory, name, cutoff_ns):
+            removed += 1
+            continue
+        if not pattern.fullmatch(name):
+            continue
+        try:
+            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_mtime_ns > cutoff_ns
+        ):
+            continue
+        try:
+            after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        fingerprint = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+        if fingerprint(before) != fingerprint(after):
+            continue
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        removed += 1
+finally:
+    os.close(directory)
+
+print(removed)
+PY
+  ) || return 0
+  [[ $expired =~ ^[0-9]+$ && $expired -gt 0 ]] || return 0
+  printf '%s expired_picker_temp_files=%s\n' "$(timestamp)" "$expired" >&2
+}
+
+prepare_darwin_proc_snapshot() {
+  [[ $REAPER_PLATFORM == Darwin ]] || return 0
+  [[ -f $INVENTORY_CORE ]] || fail "Darwin process adapter unavailable"
+  DARWIN_PROC_SNAPSHOT=$(mktemp -d "${TMPDIR:-/tmp}/session-kit-proc.XXXXXX") ||
+    fail "Darwin process snapshot creation"
+  chmod 700 "$DARWIN_PROC_SNAPSHOT" || fail "Darwin process snapshot permissions"
+  trap '[[ -z ${DARWIN_PROC_SNAPSHOT:-} ]] || rm -rf -- "$DARWIN_PROC_SNAPSHOT"' EXIT
+  local process_json=$DARWIN_PROC_SNAPSHOT/process-table.json
+  python3 "$INVENTORY_CORE" platform process-table > "$process_json" || return 1
+  chmod 600 "$process_json" || return 1
+  DARWIN_DAEMON_PID=$(python3 - "$DARWIN_PROC_SNAPSHOT" "$process_json" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+payload = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+rows = payload.get("processes") if isinstance(payload, dict) else None
+if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+    raise SystemExit("session-kit: invalid Darwin process snapshot")
+daemons = []
+for row in rows:
+    argv = row.get("cmdline")
+    if isinstance(argv, list) and argv and pathlib.Path(str(argv[0])).name == "shpool" and "daemon" in argv[1:]:
+        daemons.append(row)
+if len(daemons) != 1:
+    raise SystemExit("session-kit: expected exactly one shpool daemon")
+daemon_pid = daemons[0].get("pid")
+if not isinstance(daemon_pid, int) or daemon_pid <= 0:
+    raise SystemExit("session-kit: invalid shpool daemon identity")
+for row in rows:
+    if row.get("ppid") != daemon_pid:
+        continue
+    if row.get("args_available") is not True or not row.get("session_name"):
+        raise SystemExit("session-kit: unreadable shpool child; cleanup refused")
+for row in rows:
+    pid = row.get("pid")
+    ppid = row.get("ppid")
+    generation = row.get("start_ticks")
+    if not all(isinstance(value, int) and value >= 0 for value in (pid, ppid, generation)):
+        raise SystemExit("session-kit: invalid Darwin process identity")
+    base = root / str(pid)
+    base.mkdir(mode=0o700)
+    comm = str(row.get("comm") or "process").replace(")", "")[:128]
+    fields = ["S", str(ppid), *(["0"] * 17), str(generation), *(["0"] * 30)]
+    (base / "stat").write_text(f"{pid} ({comm}) {' '.join(fields)}\n", encoding="utf-8")
+    (base / "comm").write_text(f"{comm}\n", encoding="utf-8")
+    argv = row.get("cmdline") if isinstance(row.get("cmdline"), list) else []
+    (base / "cmdline").write_bytes(b"\0".join(str(value).encode() for value in argv) + (b"\0" if argv else b""))
+    session = row.get("session_name")
+    environ = b"SHPOOL_SESSION_NAME=" + str(session).encode() + b"\0" if session else b""
+    (base / "environ").write_bytes(environ)
+    cwd = row.get("cwd")
+    if isinstance(cwd, str) and cwd.startswith("/"):
+        try:
+            os.symlink(cwd, base / "cwd")
+        except OSError:
+            pass
+print(daemon_pid)
+PY
+  ) || return 1
+  command rm -- "$process_json"
+}
+
+if [[ -e $SENTINEL ]]; then
+  printf '%s reaper disabled by %s\n' "$(timestamp)" "$SENTINEL" >&2
+  exit 3
+fi
+
+# The sweep-only pass runs on its own five-minute timer and stops here: it
+# reads /proc and signals finished workers, and must never build the
+# guard-live inventory or touch a terminal. It sits BELOW the sentinel on
+# purpose -- their off switch has to reach the most destructive pass in the kit,
+# and putting this above it was the regression review found (lane A F1). It
+# sits above the shpool gates equally on purpose: a finished worker is
+# independent of the session manager, so a down daemon must not keep it alive.
+if [[ ${MODE:-report} == sweep ]]; then
+  sweep_status=0
+  sweep_subagents || sweep_status=$?
+  (( sweep_status == 3 )) && exit 3
+  exit 0
+fi
+[[ -n $SHPOOL && -x $SHPOOL ]] || fail "shpool executable unavailable"
+[[ $MAX_AGE_DAYS =~ ^[0-9]+$ && $MAX_AGE_DAYS -ge 1 ]] || fail "invalid prune age"
+[[ $AUTO_CLOSE_HOURS =~ ^[0-9]+$ && $AUTO_CLOSE_HOURS -ge 1 &&
+   $AUTO_CLOSE_HOURS -le 8760 ]] || fail "invalid auto-close age"
+
+expire_picker_temp_files
+
+# Immutable releases accumulate one per roll and only `current`, its recorded
+# predecessor, and whatever a STANDING window still runs are ever used again.
+# Prune the rest once they are old and provably unreferenced; keep the newest
+# three regardless, and never more than ten deletions per run.
+expire_stale_releases() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ $REAPER_PLATFORM != Darwin ]] || return 0
+  python3 - "$PROC_ROOT" <<'PY' || true
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+proc = os.path.abspath(sys.argv[1])
+home = os.path.expanduser("~")
+root = os.path.join(home, ".local", "lib", "session-kit")
+releases = os.path.join(root, "releases")
+if not os.path.isdir(releases):
+    raise SystemExit(0)
+uid = os.geteuid()
+
+keep: set[str] = set()
+def decline(reason):
+    # Silence was how this stayed broken for 152 releases: every refusal to
+    # collect now says so where the journal keeps it.
+    print(f"release GC declined: {reason}", file=sys.stderr)
+    raise SystemExit(0)
+
+
+try:
+    keep.add(os.path.basename(os.path.realpath(os.path.join(root, "current"))))
+except OSError:
+    decline("the current release link could not be read")
+try:
+    with open(
+        os.path.join(home, ".local", "state", "session-kit", "install.json"),
+        encoding="utf-8",
+    ) as handle:
+        recorded = json.load(handle)
+    for key in ("installed_release", "previous_release"):
+        value = recorded.get(key)
+        if isinstance(value, str):
+            keep.add(value)
+except (OSError, ValueError):
+    decline("install.json could not be read")
+
+# Anything ANY live same-uid process references stays; an unreadable process
+# table means no proof, so nothing is deleted.
+#
+# One /proc file per process may legitimately refuse to open: `environ` is
+# readable only for a dumpable process, and `systemd --user`, `(sd-pam)` and
+# every `sshd-session` are same-uid and permanently non-dumpable. Treating that
+# PermissionError as "no proof" aborted the whole scan before the deletion loop
+# on every systemd-user host, so this GC had never once run to completion, 152
+# release directories and 368 MB with no log line to notice it by. A process
+# whose environment cannot be read still contributes its cmdline and cwd, and
+# neither can be forged into a reference the scan misses: an unreadable
+# `environ` cannot name a release the same process is not also running.
+try:
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        base = os.path.join(proc, name)
+        evidence = []
+        try:
+            if os.stat(base, follow_symlinks=False).st_uid != uid:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            decline(f"/proc/{name} could not be inspected ({error.errno})")
+        for entry, limit in (("cmdline", 65536), ("environ", 131072)):
+            try:
+                with open(os.path.join(base, entry), "rb") as handle:
+                    evidence.append(handle.read(limit))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            except OSError as error:
+                decline(f"/proc/{name}/{entry} could not be read ({error.errno})")
+        try:
+            evidence.append(os.readlink(os.path.join(base, "cwd")).encode())
+        except OSError:
+            pass
+        for blob in evidence:
+            for match in re.finditer(rb"releases/([0-9a-f]{40})", blob):
+                keep.add(match.group(1).decode())
+except OSError:
+    decline("the process table could not be listed")
+
+entries = []
+for name in os.listdir(releases):
+    if not re.fullmatch(r"[0-9a-f]{40}", name):
+        continue
+    path = os.path.join(releases, name)
+    if os.path.islink(path) or not os.path.isdir(path):
+        continue
+    try:
+        entries.append((os.lstat(path).st_mtime, name))
+    except OSError:
+        continue
+entries.sort(reverse=True)
+for _, name in entries[:3]:
+    keep.add(name)
+
+cutoff = time.time() - 14 * 86400
+removed = 0
+for mtime, name in reversed(entries):
+    if removed >= 10 or name in keep or mtime > cutoff:
+        continue
+    target = os.path.join(releases, name)
+    # Release dirs are installed read-only; restore owner-write so the
+    # removal itself cannot half-fail.
+    for directory, _, files in os.walk(target):
+        try:
+            os.chmod(directory, 0o700)
+            for entry in files:
+                os.chmod(os.path.join(directory, entry), 0o600)
+        except OSError:
+            break
+    try:
+        shutil.rmtree(target)
+        removed += 1
+    except OSError:
+        continue
+if removed:
+    print(f"release GC removed {removed} stale release(s)", file=sys.stderr)
+PY
+}
+expire_stale_releases
+
+if [[ $REAPER_PLATFORM == Darwin ]]; then
+  prepare_darwin_proc_snapshot || fail "Darwin process snapshot unavailable"
+  PROC_ROOT=$DARWIN_PROC_SNAPSHOT
+  daemon_pid=$DARWIN_DAEMON_PID
+fi
+
+if [[ $MODE == verify ]]; then
+  [[ -f $VERIFY_FILE && ! -L $VERIFY_FILE ]] ||
+    fail "candidate proof is not a regular file"
+fi
+
+# Every terminal-closing reaper path consumes the daemon generation selected
+# by the same socket-bound guard inventory used by ordinary mutations. A
+# process-name match is not provenance: another user's lower-PID daemon can
+# carry the same session name. Verification may be handed the exact guard
+# document already built by `sp prune`; direct callers get a fresh one.
+load_bound_inventory() {
+  if [[ -n ${VERIFY_GUARD_FILE:-} ]]; then
+    [[ -f $VERIFY_GUARD_FILE && ! -L $VERIFY_GUARD_FILE ]] ||
+      fail "bound guard document is not a regular file"
+    inventory=$(command cat -- "$VERIFY_GUARD_FILE") ||
+      fail "bound guard document unavailable"
+  else
+    [[ -x $STATUS ]] || fail "guard-live status command unavailable"
+    inventory=$("$STATUS" --guard-json 2>/dev/null) ||
+      fail "guard-live inventory unavailable"
+  fi
+  export SK_REAPER_INVENTORY_JSON=$inventory
+  export SK_REAPER_BOUND_CANDIDATE=${VERIFY_FILE:-}
+  read -r daemon_pid daemon_start < <(python3 <<'PY'
+import json, os, pathlib
+
+try:
+    inventory = json.loads(os.environ["SK_REAPER_INVENTORY_JSON"])
+except (KeyError, json.JSONDecodeError):
+    raise SystemExit(2)
+if (
+    not isinstance(inventory, dict)
+    or inventory.get("source") != "live"
+    or inventory.get("stale") is not False
+    or inventory.get("warnings")
+):
+    raise SystemExit(2)
+daemon = inventory.get("daemon_generation")
+pid = daemon.get("pid") if isinstance(daemon, dict) else None
+start = daemon.get("process_start_ticks") if isinstance(daemon, dict) else None
+if (
+    not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+    or not isinstance(start, int) or isinstance(start, bool) or start < 0
+):
+    raise SystemExit(2)
+
+candidate_path = os.environ.get("SK_REAPER_BOUND_CANDIDATE")
+if candidate_path:
+    try:
+        candidate = json.loads(pathlib.Path(candidate_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit(2)
+    session_id = candidate.get("shpool_id") if isinstance(candidate, dict) else None
+    shell_pid = candidate.get("shell_pid") if isinstance(candidate, dict) else None
+    shell_start = candidate.get("shell_start_ticks") if isinstance(candidate, dict) else None
+    rows = inventory.get("sessions")
+    matches = [
+        row for row in rows
+        if isinstance(row, dict) and row.get("shpool_id_raw") == session_id
+    ] if isinstance(rows, list) else []
+    if len(matches) != 1:
+        raise SystemExit(2)
+    shell = matches[0].get("shpool_shell")
+    if candidate.get("class") == "shell-less-phantom":
+        if (
+            shell is not None
+            or matches[0].get("mutation_allowed") is not False
+            or matches[0].get("mutation_rejection_reason")
+            != "missing-shell-generation"
+        ):
+            raise SystemExit(2)
+    elif (
+        not isinstance(shell, dict)
+        or shell.get("pid") != shell_pid
+        or shell.get("process_start_ticks") != shell_start
+        or matches[0].get("mutation_allowed") is not True
+    ):
+        raise SystemExit(2)
+print(pid, start)
+PY
+  ) || fail "socket-bound daemon or candidate shell identity unavailable"
+  [[ $daemon_pid =~ ^[0-9]+$ && $daemon_start =~ ^[0-9]+$ ]] ||
+    fail "socket-bound daemon identity unavailable"
+  # The legacy PID override exists only for isolated fixtures. It used to
+  # stand in for the first-name `pgrep` result; preserving a disagreement as
+  # a refusal makes old adversarial probes exercise the safety boundary
+  # without letting the override select process evidence.
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 &&
+        -n ${SESSION_KIT_DAEMON_PID:-} &&
+        ${SESSION_KIT_DAEMON_PID} != "$daemon_pid" ]]; then
+    fail "fixture daemon evidence disagrees with socket-bound identity"
+  fi
+}
+
+# Every raw client payload that can nominate, verify, or authorize cleanup is
+# bracketed by observations of the listener holder. Both observations must be
+# the exact daemon generation in the guard document. An unknown author is not
+# evidence, and a different author is never allowed to donate its names to the
+# bound daemon's process tree.
+bound_shpool_list() {
+  local purpose=$1 before after
+  before=$(observe_reaper_holder) || before=unknown
+  BOUND_SHPOOL_JSON=$("$SHPOOL" list --json 2>/dev/null) || {
+    printf 'session-kit: %s refused: shpool list failed\n' "$purpose" >&2
+    return 1
+  }
+  after=$(observe_reaper_holder) || after=unknown
+  if [[ $before == unknown ]]; then
+    printf 'session-kit: %s refused: socket holder before shpool list is unknown; expected PID %s start %s\n' \
+      "$purpose" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  fi
+  if [[ $before != "$daemon_pid"$'\t'"$daemon_start" ]]; then
+    printf 'session-kit: %s refused: socket holder before shpool list is %s; expected PID %s start %s\n' \
+      "$purpose" "${before//$'\t'/ start }" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  fi
+  if [[ $after == unknown ]]; then
+    printf 'session-kit: %s refused: socket holder after shpool list is unknown; expected PID %s start %s\n' \
+      "$purpose" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  fi
+  if [[ $after != "$daemon_pid"$'\t'"$daemon_start" ]]; then
+    printf 'session-kit: %s refused: shpool list was answered across a socket-holder change to %s; expected PID %s start %s\n' \
+      "$purpose" "${after//$'\t'/ start }" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  fi
+  return 0
+}
+
+observe_reaper_holder() {
+  local observed
+  if observed=$(sk_observe_shpool_holder 2>/dev/null); then
+    printf '%s\n' "$observed"
+    return 0
+  fi
+  # Existing synthetic reaper fixtures carry no kernel socket. Their guarded
+  # PID seam may stand in for the observation only behind the testing gate and
+  # only when it agrees with the already-loaded exact guard generation.
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 &&
+        ${SESSION_KIT_DAEMON_PID:-} == "$daemon_pid" ]]; then
+    printf '%s\t%s\n' "$daemon_pid" "$daemon_start"
+    return 0
+  fi
+  return 1
+}
+
+require_bound_holder() {
+  local purpose=$1 observed
+  observed=$(observe_reaper_holder) || {
+    printf 'session-kit: %s refused: current socket holder is unknown; expected PID %s start %s\n' \
+      "$purpose" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  }
+  if [[ $observed != "$daemon_pid"$'\t'"$daemon_start" ]]; then
+    printf 'session-kit: %s refused: socket holder is %s; expected PID %s start %s\n' \
+      "$purpose" "${observed//$'\t'/ start }" "$daemon_pid" "$daemon_start" >&2
+    return 1
+  fi
+  return 0
+}
+
+if [[ $MODE == auto ]]; then
+  # Worker completion is process-tree based and does not consume a shpool
+  # payload. It therefore remains independent of terminal inventory health.
+  sweep_subagents
+fi
+load_bound_inventory
+bound_shpool_list "initial reaper snapshot" ||
+  fail "raw shpool snapshot author does not match the bound daemon"
+json=$BOUND_SHPOOL_JSON
+
+# A Codex App Server socket dies with its window, but the private directory
+# holding it survives every reboot, so the tree grows one entry per Codex
+# session forever, and a live-rename sweep that walks it pays for every
+# corpse. Remove only directories whose session the daemon no longer lists,
+# whose socket refuses a connection, and that nothing has touched for an hour.
+# Entirely fail-open: no proof, no removal.
+expire_stale_app_server_dirs() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ -f $RELEASE_DIR/lib/sessionkit_inventory/reaper.py ]] || return 0
+  local swept
+  swept=$(SK_REAPER_SHPOOL_JSON=$json \
+    SK_REAPER_STATE_DIR=$STATE_DIR \
+    PYTHONPATH="$RELEASE_DIR/lib" \
+    python3 -m sessionkit_inventory.reaper sweep-app-servers) || return 0
+  [[ $swept =~ ^[0-9]+$ && $swept -gt 0 ]] || return 0
+  printf '%s expired_app_server_dirs=%s\n' "$(timestamp)" "$swept" >&2
+}
+expire_stale_app_server_dirs
+
+if [[ $MODE == auto ]]; then
+  [[ -f $RELEASE_DIR/lib/sessionkit_inventory/reaper.py ]] ||
+    fail "auto-close planner unavailable"
+  export SK_REAPER_SHPOOL_JSON=$json
+  export SK_REAPER_INVENTORY_JSON=$inventory
+  export SK_REAPER_STATE_DIR=$STATE_DIR
+  export SK_REAPER_PROC_ROOT=$PROC_ROOT
+  export SK_REAPER_AUTO_CLOSE_HOURS=$AUTO_CLOSE_HOURS
+  plan_args=(plan)
+  if [[ $DRY_RUN == 1 ]]; then plan_args+=(--no-write); fi
+  plan=$(PYTHONPATH="$RELEASE_DIR/lib" \
+    python3 -m sessionkit_inventory.reaper "${plan_args[@]}") ||
+    fail "auto-close planning failed"
+  if [[ $DRY_RUN == 1 ]]; then
+    printf '%s\n' "$plan"
+    exit 0
+  fi
+  umask 077
+  mkdir -p "$STATE_DIR" || fail "state directory creation"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  candidate_file=$STATE_DIR/auto-close-candidates.json
+  [[ -f $candidate_file && ! -L $candidate_file ]] ||
+    fail "auto-close candidate document unavailable"
+  candidate_count=$(python3 - "$candidate_file" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+items=value.get("candidates") if isinstance(value,dict) else None
+if not isinstance(items,list):
+    raise SystemExit(1)
+print(len(items))
+PY
+  ) || fail "auto-close candidate document is invalid"
+  if [[ $candidate_count == 0 ]]; then
+    # The sweep runs on EVERY auto pass, not only on the ones that had a
+    # session to close. Nothing else in the kit runs it, and a machine with no
+    # auto-close candidate is the ordinary case -- so leaving it below this
+    # early exit meant the scheduled half of "a copy comes back" almost never
+    # happened, and a copy kept because a worker was still writing was kept for
+    # good.
+    run_worktree_sweep
+    log_reaper_run auto "$plan worktrees_released=$swept worktrees_kept=$swept_kept"
+    printf '%s worktrees_released=%s worktrees_kept=%s\n' \
+      "$plan" "$swept" "$swept_kept"
+    exit 0
+  fi
+  # The creation lock is the shared Session Kit attach/create/close barrier.
+  # Reuse the privacy-minimal capped action log already used by picker actions.
+  sk_prepare_state || fail "private action state unavailable"
+  exec 9>"$STATE_DIR/create.lock" || fail "creation lock unavailable"
+  sk_lock_acquire 9 "$STATE_DIR/create.lock" || fail "creation lock unavailable"
+  actions=0
+  proof=
+  trap '[[ -z ${proof:-} ]] || rm -f -- "$proof"' EXIT
+  for (( candidate_index=0; candidate_index<candidate_count; candidate_index++ )); do
+    proof=$(mktemp "$STATE_DIR/auto-close-proof.json.XXXXXX") ||
+      fail "private candidate proof creation"
+    chmod 600 "$proof" || fail "private candidate proof permissions"
+    python3 - "$candidate_file" "$candidate_index" "$proof" <<'PY' ||
+import json,os,sys
+source,index,destination=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+value=json.load(open(source,encoding="utf-8"))
+item=value["candidates"][index]
+with open(destination,"w",encoding="utf-8") as handle:
+    json.dump(item,handle,sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+      fail "private candidate proof extraction"
+    target=$(python3 - "$proof" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+target=value.get("shpool_id") if isinstance(value,dict) else None
+if not isinstance(target,str):
+    raise SystemExit(1)
+print(target)
+PY
+    ) || fail "private candidate target is invalid"
+    for verification_pass in 1 2; do
+      fresh_inventory=$("$STATUS" --guard-json 2>/dev/null) ||
+        fail "fresh guard-live inventory unavailable"
+      SK_REAPER_FRESH_INVENTORY=$fresh_inventory python3 - \
+        "$daemon_pid" "$daemon_start" <<'PY' ||
+import json,os,sys
+value=json.loads(os.environ["SK_REAPER_FRESH_INVENTORY"])
+daemon=value.get("daemon_generation") if isinstance(value,dict) else None
+expected=(int(sys.argv[1]),int(sys.argv[2]))
+actual=(daemon.get("pid"),daemon.get("process_start_ticks")) if isinstance(daemon,dict) else None
+raise SystemExit(0 if actual == expected else 1)
+PY
+        fail "fresh guard-live inventory changed daemon generation"
+      inventory=$fresh_inventory
+      bound_shpool_list "auto-close verification pass $verification_pass" ||
+        fail "auto-close snapshot author changed"
+      json=$BOUND_SHPOOL_JSON
+      export SK_REAPER_SHPOOL_JSON=$json
+      export SK_REAPER_INVENTORY_JSON=$inventory
+      PYTHONPATH="$RELEASE_DIR/lib" \
+        python3 -m sessionkit_inventory.reaper verify "$proof" >/dev/null ||
+        fail "auto-close candidate changed or is no longer safe"
+    done
+    sk_log_action auto_close requested ||
+      fail "private action log unavailable; nothing closed"
+    read -r candidate_class candidate_started closed_shell_pid closed_shell_start < <(
+      python3 - "$proof" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+print(
+    value.get("class", "provider-exited"),
+    value.get("started_at_unix_ms", ""),
+    value.get("shell_pid", ""),
+    value.get("shell_start_ticks", ""),
+)
+PY
+    ) || fail "auto-close candidate shell identity is invalid"
+    [[ $candidate_started =~ ^[0-9]+$ ]] ||
+      fail "auto-close candidate manager generation is invalid"
+    if [[ $candidate_class == shell-less-phantom ]]; then
+      [[ -z $closed_shell_pid && -z $closed_shell_start ]] ||
+        fail "shell-less candidate unexpectedly carries a shell generation"
+      require_bound_holder "shell-less cleanup dispatch for $target" ||
+        fail "auto-close socket holder changed before manager finalization"
+      sk_finalize_dead_shpool_entry \
+        "$target" "$daemon_pid" "$daemon_start" "$candidate_started" ||
+        fail "dead manager entry $target remains after finalization"
+    else
+      [[ $closed_shell_pid =~ ^[0-9]+$ && $closed_shell_start =~ ^[0-9]+$ ]] ||
+        fail "auto-close candidate shell identity is invalid"
+      # The lock serializes kit callers. The destructive act is addressed to
+      # the exact verified shell generation, never to a session name.
+      require_bound_holder "auto-close dispatch for $target" ||
+        fail "auto-close socket holder changed before exact termination; no signal was sent"
+      if ! shell_proof=$(sk_terminate_exact_shell \
+          "$daemon_pid" "$daemon_start" \
+          "$closed_shell_pid" "$closed_shell_start" 2>&1); then
+        sk_cleanup_dead_shpool_entry "$target" \
+          "$daemon_pid" "$daemon_start" \
+          "$closed_shell_pid" "$closed_shell_start" "$candidate_started" || true
+        fail "exact shell PID $closed_shell_pid start $closed_shell_start was not terminated ($shell_proof); nothing was reported closed"
+      fi
+      sk_cleanup_dead_shpool_entry "$target" \
+        "$daemon_pid" "$daemon_start" \
+        "$closed_shell_pid" "$closed_shell_start" "$candidate_started" ||
+        fail "dead manager entry $target remains after exact shell termination"
+    fi
+    if bound_shpool_list "auto-close post-close cleanup snapshot"; then
+      after=$BOUND_SHPOOL_JSON
+      SK_REAPER_POST_JSON=$after python3 - "$target" <<'PY' ||
+import json,os,sys
+payload=json.loads(os.environ["SK_REAPER_POST_JSON"])
+rows=payload.get("sessions") if isinstance(payload,dict) else payload
+if not isinstance(rows,list):
+    raise SystemExit(1)
+raise SystemExit(1 if any(
+    isinstance(row,dict) and row.get("name")==sys.argv[1] for row in rows
+) else 0)
+PY
+        fail "manager entry $target remains after cleanup postcondition"
+    else
+      printf 'session-kit: exact shell for %s is dead; post-cleanup list skipped because its author is unproved\n' \
+        "$target" >&2
+    fi
+    sk_log_action auto_close closed ||
+      fail "close succeeded but private action log update failed"
+    # A worker the sweep closed gives its own copy of the code back as well.
+    # Never fatal and never forced: unmerged work keeps the directory, and the
+    # line that says so goes to this run's output rather than to /dev/null --
+    # a copy kept for work in it is the one thing here worth reading later.
+    sk_release_worktree "$target" 2>/dev/null || true
+    rm -f -- "$proof"
+    proof=
+    actions=$((actions + 1))
+  done
+  trap - EXIT
+  run_worktree_sweep
+  # A copy the sweep KEPT because there is unmerged work in it is the line
+  # worth finding later, and the summary counted only the ones it removed.
+  summary="auto_candidates=$candidate_count actions=$actions worktrees_released=$swept worktrees_kept=$swept_kept"
+  log_reaper_run auto "$summary"
+  printf '%s\n' "$summary"
+  exit 0
+fi
+
+if [[ $MODE == verify ]]; then
+  # The last gate before a kill re-proves the keep marker too: a candidate
+  # nominated hours ago may have been kept since, from the exit menu of the
+  # very terminal about to be closed.
+  [[ -f $RELEASE_DIR/lib/sessionkit_inventory/lifecycle.py ]] ||
+    fail "keep-marker reader unavailable; nothing was pruned"
+  SK_REAPER_LIB_DIR=$RELEASE_DIR/lib \
+  SK_REAPER_STATE_DIR=$STATE_DIR \
+  python3 - "$VERIFY_FILE" <<'KEEP' ||
+import json, os, sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["SK_REAPER_LIB_DIR"])
+from sessionkit_inventory.lifecycle import cleanup_protected
+
+candidate = json.load(open(sys.argv[1], encoding="utf-8"))
+session_id = candidate.get("shpool_id") if isinstance(candidate, dict) else None
+if not isinstance(session_id, str):
+    raise SystemExit(2)
+raise SystemExit(
+    1
+    if session_id
+    in cleanup_protected(Path(os.environ["SK_REAPER_STATE_DIR"]), [session_id])
+    else 0
+)
+KEEP
+    fail "candidate is marked keep; automatic cleanup is disabled for it"
+  export SK_REAPER_JSON=$json
+  export SK_REAPER_VERIFY_FILE=$VERIFY_FILE
+  export SK_REAPER_PROC_ROOT=$PROC_ROOT
+  export SK_REAPER_DAEMON_PID=$daemon_pid
+  export SK_REAPER_DAEMON_START=$daemon_start
+  export SK_REAPER_MAX_AGE_DAYS=$MAX_AGE_DAYS
+  python3 <<'PY' || fail "candidate changed or is no longer empty"
+import json, os, pathlib, re, time
+
+payload = json.loads(os.environ["SK_REAPER_JSON"])
+rows = payload.get("sessions") if isinstance(payload, dict) else payload
+candidate = json.loads(pathlib.Path(os.environ["SK_REAPER_VERIFY_FILE"]).read_text())
+proc_root = pathlib.Path(os.environ["SK_REAPER_PROC_ROOT"])
+daemon_pid = int(os.environ["SK_REAPER_DAEMON_PID"])
+daemon_start = int(os.environ["SK_REAPER_DAEMON_START"])
+required = (
+    "shpool_id",
+    "started_at_unix_ms",
+    "last_disconnected_at_unix_ms",
+    "shell_pid",
+    "shell_start_ticks",
+)
+if not isinstance(rows, list) or not isinstance(candidate, dict):
+    raise SystemExit(2)
+if any(key not in candidate for key in required):
+    raise SystemExit(2)
+session_id = candidate["shpool_id"]
+if not isinstance(session_id, str) or len(session_id.encode()) > 128:
+    raise SystemExit(2)
+disconnected = candidate["last_disconnected_at_unix_ms"]
+if not isinstance(disconnected, int):
+    raise SystemExit(2)
+minimum_age_ms = int(os.environ["SK_REAPER_MAX_AGE_DAYS"]) * 86400 * 1000
+if int(time.time() * 1000) - disconnected < minimum_age_ms:
+    raise SystemExit(2)
+if not re.fullmatch(r"(?:main(?:[1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)", session_id):
+    raise SystemExit(2)
+matched = [
+    row for row in rows
+    if isinstance(row, dict)
+    and row.get("name") == session_id
+    and row.get("started_at_unix_ms") == candidate["started_at_unix_ms"]
+    and row.get("last_disconnected_at_unix_ms") == disconnected
+    and str(row.get("status", "")).lower() == "disconnected"
+]
+if len(matched) != 1:
+    raise SystemExit(2)
+
+def stat(pid):
+    try:
+        text = (proc_root / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    end = text.rfind(")")
+    fields = text[end + 2:].split()
+    if len(fields) < 20:
+        return None
+    return int(fields[1]), int(fields[19])
+
+def read_bytes(pid, name):
+    return (proc_root / str(pid) / name).read_bytes()
+
+processes = {}
+daemon_before = stat(daemon_pid)
+if daemon_before is None or daemon_before[1] != daemon_start:
+    raise SystemExit(2)
+try:
+    pids = sorted(int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit())
+except OSError:
+    raise SystemExit(2)
+for pid in pids:
+    before = stat(pid)
+    if before is None:
+        continue
+    try:
+        comm = read_bytes(pid, "comm").decode("utf-8", "replace").strip()
+        cmdline = read_bytes(pid, "cmdline").replace(b"\0", b" ").decode("utf-8", "replace")
+        environ = read_bytes(pid, "environ").split(b"\0")
+    except OSError:
+        comm = None
+        cmdline = None
+        environ = None
+    after = stat(pid)
+    if before != after:
+        continue
+    processes[pid] = {
+        "ppid": before[0],
+        "start_ticks": before[1],
+        "comm": comm,
+        "cmdline": cmdline,
+        "environ": environ,
+    }
+
+children = {}
+for pid, row in processes.items():
+    children.setdefault(row["ppid"], []).append(pid)
+shells = []
+for pid in children.get(daemon_pid, []):
+    environ = processes[pid]["environ"]
+    if environ is None:
+        continue
+    for item in environ:
+        if item.startswith(b"SHPOOL_SESSION_NAME="):
+            if item.split(b"=", 1)[1].decode("utf-8", "replace") == session_id:
+                shells.append(pid)
+            break
+if len(shells) != 1:
+    raise SystemExit(2)
+shell = shells[0]
+if shell != candidate["shell_pid"] or processes[shell]["start_ticks"] != candidate["shell_start_ticks"]:
+    raise SystemExit(2)
+direct = children.get(shell, [])
+if direct:
+    if len(direct) != 1:
+        raise SystemExit(2)
+    wrapper = direct[0]
+    row = processes[wrapper]
+    if row["comm"] != "script" or "bash -i" not in row["cmdline"]:
+        raise SystemExit(2)
+    inner = children.get(wrapper, [])
+    if len(inner) != 1 or processes[inner[0]]["comm"] not in {"bash", "sh"}:
+        raise SystemExit(2)
+    if children.get(inner[0], []):
+        raise SystemExit(2)
+if stat(shell) != (processes[shell]["ppid"], processes[shell]["start_ticks"]):
+    raise SystemExit(2)
+if stat(daemon_pid) != daemon_before:
+    raise SystemExit(2)
+PY
+  if [[ $REAPER_PLATFORM == Darwin ]]; then
+    read -r native_shell_pid native_shell_generation < <(
+      python3 - "$VERIFY_FILE" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+print(value.get("shell_pid", ""), value.get("shell_start_ticks", ""))
+PY
+    )
+    [[ $native_shell_pid =~ ^[0-9]+$ && $native_shell_generation =~ ^[0-9]+$ ]] ||
+      fail "candidate has no native shell generation"
+    python3 "$INVENTORY_CORE" platform process-generation-is \
+      "$native_shell_pid" "$native_shell_generation" >/dev/null 2>&1 ||
+      fail "candidate shell generation changed"
+  fi
+  bound_shpool_list "final candidate verification" ||
+    fail "second shpool list author does not match the bound daemon"
+  second=$BOUND_SHPOOL_JSON
+  export SK_REAPER_SECOND_JSON=$second
+  python3 - "$VERIFY_FILE" <<'PY' || fail "candidate changed after process proof"
+import json,os,sys
+candidate=json.load(open(sys.argv[1]))
+payload=json.loads(os.environ["SK_REAPER_SECOND_JSON"])
+rows=payload.get("sessions") if isinstance(payload,dict) else payload
+matches=[
+    row for row in rows
+    if isinstance(row,dict)
+    and row.get("name")==candidate["shpool_id"]
+    and row.get("started_at_unix_ms")==candidate["started_at_unix_ms"]
+    and row.get("last_disconnected_at_unix_ms")==candidate["last_disconnected_at_unix_ms"]
+    and str(row.get("status","")).lower()=="disconnected"
+]
+raise SystemExit(0 if len(matches)==1 else 1)
+PY
+  printf 'session-kit: this session is idle, empty, and safe to close.\n'
+  exit 0
+fi
+
+if [[ $DRY_RUN != 1 ]]; then
+  umask 077
+  mkdir -p "$STATE_DIR" || fail "state directory creation"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+fi
+
+# A terminal that answered the exit menu with "keep" was promised no
+# unattended cleanup, and `sp prune` closes what this report nominates. The
+# marker lives in the lifecycle record, so without its reader nothing is
+# nominated at all.
+[[ -f $RELEASE_DIR/lib/sessionkit_inventory/lifecycle.py ]] ||
+  fail "keep-marker reader unavailable; nothing was nominated"
+
+export SK_REAPER_JSON=$json
+export SK_REAPER_STATE_DIR=$STATE_DIR
+export SK_REAPER_PROC_ROOT=$PROC_ROOT
+export SK_REAPER_DAEMON_PID=$daemon_pid
+export SK_REAPER_DAEMON_START=$daemon_start
+export SK_REAPER_MAX_AGE_DAYS=$MAX_AGE_DAYS
+export SK_REAPER_DRY_RUN=$DRY_RUN
+export SK_REAPER_LIB_DIR=$RELEASE_DIR/lib
+
+summary=$(python3 <<'PY'
+import json, os, pathlib, sys, tempfile, time
+
+sys.path.insert(0, os.environ["SK_REAPER_LIB_DIR"])
+from sessionkit_inventory.lifecycle import cleanup_protected
+
+payload = json.loads(os.environ["SK_REAPER_JSON"])
+rows = payload.get("sessions") if isinstance(payload, dict) else payload
+if not isinstance(rows, list):
+    raise SystemExit(2)
+for row in rows:
+    if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+        raise SystemExit(2)
+inventory = json.loads(os.environ["SK_REAPER_INVENTORY_JSON"])
+guard_rows = inventory.get("sessions") if isinstance(inventory, dict) else None
+if not isinstance(guard_rows, list):
+    raise SystemExit(2)
+guard_by_id = {}
+for item in guard_rows:
+    session_id = item.get("shpool_id_raw") if isinstance(item, dict) else None
+    if not isinstance(session_id, str) or session_id in guard_by_id:
+        raise SystemExit(2)
+    guard_by_id[session_id] = item
+
+state_dir = pathlib.Path(os.environ["SK_REAPER_STATE_DIR"])
+proc_root = pathlib.Path(os.environ["SK_REAPER_PROC_ROOT"])
+daemon_pid = int(os.environ["SK_REAPER_DAEMON_PID"])
+daemon_start = int(os.environ["SK_REAPER_DAEMON_START"])
+age_ms = int(os.environ["SK_REAPER_MAX_AGE_DAYS"]) * 86400 * 1000
+dry = os.environ["SK_REAPER_DRY_RUN"] == "1"
+now_ms = int(time.time() * 1000)
+
+def proc_bytes(pid, name):
+    try:
+        return (proc_root / str(pid) / name).read_bytes()
+    except OSError:
+        return b""
+
+def proc_text(pid, name):
+    return proc_bytes(pid, name).decode("utf-8", "replace")
+
+def proc_stat(pid):
+    text = proc_text(pid, "stat")
+    if not text:
+        return None
+    end = text.rfind(")")
+    fields = text[end + 2:].split()
+    if len(fields) < 20:
+        return None
+    return {"ppid": int(fields[1]), "start_ticks": int(fields[19])}
+
+pids = []
+if proc_root.exists():
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            pids.append(int(entry.name))
+children = {}
+stats = {}
+processes = {}
+for pid in pids:
+    before = proc_stat(pid)
+    if not before:
+        continue
+    comm_value = proc_text(pid, "comm").strip()
+    cmdline_value = proc_bytes(pid, "cmdline").replace(b"\0", b" ").decode("utf-8", "replace")
+    environ_value = proc_bytes(pid, "environ").split(b"\0")
+    after = proc_stat(pid)
+    if before != after:
+        continue
+    stats[pid] = before
+    processes[pid] = {
+        "comm": comm_value,
+        "cmdline": cmdline_value,
+        "environ": environ_value,
+    }
+    children.setdefault(before["ppid"], []).append(pid)
+
+daemon_stat = stats.get(daemon_pid)
+if not daemon_stat or daemon_stat["start_ticks"] != daemon_start:
+    raise SystemExit(2)
+
+shells = {}
+duplicate_shells = set()
+for pid in children.get(daemon_pid, []):
+    for item in processes[pid]["environ"]:
+        if item.startswith(b"SHPOOL_SESSION_NAME="):
+            name = item.split(b"=", 1)[1].decode("utf-8", "replace")
+            if name in shells:
+                duplicate_shells.add(name)
+            else:
+                shells[name] = pid
+            break
+for name in duplicate_shells:
+    shells.pop(name, None)
+
+def comm(pid):
+    return processes.get(pid, {}).get("comm", "")
+
+def cmdline(pid):
+    return processes.get(pid, {}).get("cmdline", "")
+
+def verified_empty(shell_pid):
+    direct = children.get(shell_pid, [])
+    if not direct:
+        return True
+    if len(direct) != 1:
+        return False
+    wrapper = direct[0]
+    if comm(wrapper) != "script" or "bash -i" not in cmdline(wrapper):
+        return False
+    inner = children.get(wrapper, [])
+    if len(inner) != 1 or comm(inner[0]) not in {"bash", "sh"}:
+        return False
+    return not children.get(inner[0], [])
+
+previous_path = state_dir / "reaper-observations.json"
+try:
+    previous = json.loads(previous_path.read_text()).get("observations", {})
+except (OSError, ValueError, AttributeError):
+    previous = {}
+
+# Read once, before the loop: the keep marker is per session and the
+# lifecycle reader fails closed on anything it cannot validate.
+protected = cleanup_protected(
+    state_dir,
+    [row["name"] for row in rows],
+)
+
+observations = {}
+candidates = []
+for row in rows:
+    name = row["name"]
+    status = str(row.get("status", "")).lower()
+    disconnected = row.get("last_disconnected_at_unix_ms")
+    shell_pid = shells.get(name)
+    stat = stats.get(shell_pid) if shell_pid else None
+    if status != "disconnected" or not isinstance(disconnected, int) or not shell_pid or not stat:
+        continue
+    guard = guard_by_id.get(name)
+    guard_shell = guard.get("shpool_shell") if isinstance(guard, dict) else None
+    if (
+        not isinstance(guard_shell, dict)
+        or guard.get("started_at_unix_ms") != row.get("started_at_unix_ms")
+        or str(guard.get("shpool_status", "")).lower() != status
+        or guard.get("mutation_allowed") is not True
+        or guard_shell.get("pid") != shell_pid
+        or guard_shell.get("process_start_ticks") != stat["start_ticks"]
+    ):
+        raise SystemExit(2)
+    key = f'{row.get("started_at_unix_ms")}:{disconnected}:{shell_pid}:{stat["start_ticks"]}'
+    empty = verified_empty(shell_pid)
+    observations[name] = {
+        "key": key,
+        "first_verified_at_unix_ms": previous.get(name, {}).get("first_verified_at_unix_ms", now_ms)
+        if previous.get(name, {}).get("key") == key and empty else now_ms,
+        "empty": empty,
+    }
+    prior = previous.get(name, {})
+    old_enough = now_ms - disconnected >= age_ms
+    seen_twice = prior.get("key") == key and prior.get("empty") is True
+    if name in protected:
+        continue
+    if empty and old_enough and seen_twice:
+        candidates.append({
+            "shpool_id": name,
+            "started_at_unix_ms": row.get("started_at_unix_ms"),
+            "last_disconnected_at_unix_ms": disconnected,
+            "shell_pid": shell_pid,
+            "shell_start_ticks": stat["start_ticks"],
+        })
+
+candidate_doc = {
+    "schema_version": 1,
+    "generated_at_unix_ms": now_ms,
+    "policy": "confirmed-prune-only",
+    # The window is configurable, so it travels with the list rather than
+    # being a number the reader assumes. `sp prune` inherits the caller's
+    # environment: a one-day nomination printed under a seven-day heading is
+    # a person closing sessions they were told were a week old.
+    "max_age_days": int(os.environ["SK_REAPER_MAX_AGE_DAYS"]),
+    "candidates": candidates,
+}
+observation_doc = {
+    "schema_version": 1,
+    "generated_at_unix_ms": now_ms,
+    "observations": observations,
+}
+
+def atomic_json(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+current_daemon = proc_stat(daemon_pid)
+if current_daemon != daemon_stat:
+    raise SystemExit(2)
+
+if not dry:
+    atomic_json(previous_path, observation_doc)
+    atomic_json(state_dir / "prune-candidates.json", candidate_doc)
+
+print(f"sessions={len(rows)} disconnected={sum(str(r.get('status','')).lower() == 'disconnected' for r in rows)} candidates={len(candidates)} actions=0 kept={len(protected)}")
+PY
+) || fail "invalid inventory or process map"
+
+log_reaper_run candidates "$summary"
+
+printf '%s\n' "$summary"

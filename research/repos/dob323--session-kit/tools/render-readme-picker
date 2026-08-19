@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Render the README's picker screenshots from Session Kit's real picker.
+
+Each picture is a terminal window with a picker screen inside it. The contents
+are captured from the running picker through the login test fixture -- not
+drawn, not mocked, not typeset by hand -- and the window chrome around it is
+the only thing this tool adds.
+
+Two screens ship: the session list, and the needs-you screen behind `a`. They
+are captured in one run of the picker so they cannot describe different
+inventories, and the guards below refuse to save a pair that disagrees.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+TOOLS = Path(__file__).resolve().parent
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import readme_art_lib as art  # noqa: E402
+import readme_capture as capture  # noqa: E402
+import readme_keys as keys  # noqa: E402
+
+COLUMNS = art.COLUMNS
+
+# The list screen has to show every state word the README's table defines, or
+# the table is explaining something the picture does not contain.
+REQUIRED = ("Open elsewhere", "Ready", "needs you", "question", "idle")
+
+
+def window_html(frame: str) -> tuple[str, int, int]:
+    """The captured screen inside a terminal window."""
+
+    return art.window_html(capture.frame_html(frame), len(frame.splitlines()))
+
+
+def check_list_screen(frame: str) -> None:
+    readable = capture.plain(frame)
+    missing = [wanted for wanted in REQUIRED if wanted not in readable]
+    if missing:
+        raise SystemExit(
+            "the captured screen is missing what the README describes "
+            f"({', '.join(missing)}); refusing to ship it"
+        )
+    if "…" in readable:
+        raise SystemExit(
+            f"the picker elided a title at {COLUMNS} columns; widen the capture "
+            "rather than shipping a truncated screenshot"
+        )
+    keys.refuse_undocumented_keys(frame)
+
+
+def write(frame: str, output: Path) -> None:
+    markup, width, height = window_html(frame)
+    html = art.page(markup, art.window_css(), width=width, height=height)
+    art.render(html, output, width=width, height=height, scale=1)
+    print(f"wrote {output} ({width}x{height})")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--assets", type=Path, default=art.ASSETS)
+    args = parser.parse_args()
+
+    # `a` opens the needs-you screen, `b` leaves it, `q` leaves the picker.
+    frames = capture.capture(b"a\nb\nq\n", columns=COLUMNS)
+    listing = capture.list_frame(frames)
+    needs = capture.needs_frame(frames)
+
+    check_list_screen(listing)
+    capture.refuse_disagreeing_screens(listing, needs)
+
+    write(listing, args.assets / "picker.png")
+    write(needs, args.assets / "needs-you.png")
+    print(f"both screens came from one run of {len(frames)} real captures")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

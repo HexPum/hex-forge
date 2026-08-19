@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible problem on the supported Linux or macOS beta
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials, hostnames, account names, private paths, titles, UUIDs, terminal output, journals, prompts, and responses. Use private vulnerability reporting for any security or data-exposure concern.
+  - type: input
+    id: version
+    attributes:
+      label: Session Kit version
+      description: Provide a tag or full commit ID.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+      description: Provide Linux distribution or macOS version, architecture, and user-service manager.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Relevant versions
+      description: Include Bash, Python, shpool, Claude Code, and Codex versions as applicable.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - The picker or session colors
+        - Session state (needs you, working, idle)
+        - Open or move
+        - Provider exit or reopen
+        - Closing a session
+        - Restore or repair
+        - Cleanup
+        - Install, update, rollback, or uninstall
+        - Privacy or journals
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+      description: Describe the result without private session data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal sanitized reproduction
+      description: Give the shortest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: dropdown
+    id: mutation
+    attributes:
+      label: Did anything change?
+      description: Include session attachment, provider lifecycle, and private local state.
+      options:
+        - "No"
+        - "Yes"
+        - "Unknown"
+    validations:
+      required: true

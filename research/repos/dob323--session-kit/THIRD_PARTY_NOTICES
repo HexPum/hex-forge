@@ -1,0 +1,30 @@
+Third-party notices
+===================
+
+shpool
+------
+
+Session Kit works with shpool and includes optional source patches against
+shpool 0.11.0:
+
+  shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+  shpool-patch/0002-restore-input-modes-on-reattach.patch
+  shpool-patch/0003-kill-tolerates-an-already-dead-shell.patch
+  shpool-patch/0004-detach-must-not-hold-the-shells-lock.patch
+  shpool-patch/0005-attach-must-not-discard-the-shells-exit-status.patch
+  shpool-patch/0006-coalesce-client-resize-bursts.patch
+
+Upstream: https://github.com/shell-pool/shpool
+Base revision: v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
+Copyright 2023 Google LLC, per the upstream source headers.
+
+shpool is licensed under the Apache License, Version 2.0. The patches modify
+the corresponding upstream source and remain subject to that license and
+upstream notices. Each patch file carries a comment header naming the upstream
+project, its license, the base revision, and what that patch changes.
+
+Session Kit does not include the shpool source tree or a shpool binary.
+
+The Apache License text is included at:
+
+  LICENSES/Apache-2.0.txt

@@ -1,0 +1,124 @@
+{
+  "name": "@qoder-ai/better-harness",
+  "version": "0.6.4",
+  "description": "Build an AI-ready engineering system for safe coding-agent delivery and continuous software improvement.",
+  "license": "MIT",
+  "author": {
+    "name": "Qoder",
+    "email": "dev@qoder.com",
+    "url": "https://qoder.com/"
+  },
+  "homepage": "https://github.com/QoderAI/better-harness#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/QoderAI/better-harness.git"
+  },
+  "bugs": {
+    "url": "https://github.com/QoderAI/better-harness/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "qoder",
+    "better-harness",
+    "ai-delivery",
+    "continuous-improvement",
+    "agent-harness",
+    "pi-package"
+  ],
+  "type": "module",
+  "workspaces": [
+    "packages/harness",
+    "packages/harness-ui",
+    "packages/harness-studio"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "files": [
+    ".claude-plugin/",
+    ".codex-plugin/",
+    ".cursor-plugin/",
+    ".github/plugin/",
+    ".qoder-plugin/",
+    ".kimi-plugin/",
+    "qwen-extension.json",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "case-studies/",
+    "docs/",
+    "!docs/docs/",
+    "!docs/i18n/",
+    "!docs/src/",
+    "!docs/static/",
+    "!docs/scripts/",
+    "!docs/build/",
+    "!docs/.docusaurus/",
+    "!docs/node_modules/",
+    "!docs/vendor/",
+    "!docs/docusaurus.config.js",
+    "!docs/sidebars.js",
+    "!docs/package.json",
+    "!docs/package-lock.json",
+    "hooks/",
+    "models/",
+    "prompts/",
+    "references/",
+    "scripts/",
+    "!scripts/packaging/",
+    "skills/",
+    "!skills/**/.plugin-eval/",
+    "templates/"
+  ],
+  "bin": {
+    "better-harness": "scripts/better-harness.mjs"
+  },
+  "scripts": {
+    "bundle:zip": "node scripts/npm-package/create-bundle.mjs",
+    "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s",
+    "changelog:unreleased": "conventional-changelog -p angular -u",
+    "check": "npm test && npm run harness:generated && npm run harness:test && npm run harness-ui:test && npm run harness-studio:test && npm run pack:verify",
+    "harness:build": "npm run build -w @qoder-ai/harness",
+    "harness:generated": "npm run check:generated -w @qoder-ai/harness",
+    "harness:test": "npm test -w @qoder-ai/harness",
+    "harness-ui:build": "npm run build -w @qoder-ai/harness-ui",
+    "harness-ui:test": "npm test -w @qoder-ai/harness-ui",
+    "harness-studio:build": "npm run build -w @qoder-ai/harness-studio",
+    "harness-studio:test": "npm test -w @qoder-ai/harness-studio",
+    "harness-studio:test:browser": "npm run test:browser -w @qoder-ai/harness-studio",
+    "inspector": "node scripts/harness-inspector/cli.mjs render",
+    "inspector:open": "node scripts/harness-inspector/cli.mjs render --open",
+    "inspector:visual-check": "node scripts/harness-inspector/visual-contract-check.mjs",
+    "pack:verify": "node scripts/npm-package/verify-pack.mjs",
+    "publish:dry-run": "npm publish --dry-run --access public --registry https://registry.npmjs.org",
+    "prepublishOnly": "npm run check",
+    "preview": "node scripts/harness-analysis/canvas-preview-server.mjs",
+    "preview:canvas": "node scripts/harness-analysis/canvas-preview-server.mjs",
+    "test": "vitest run",
+    "test:ci": "vitest run --config vitest.ci.config.mjs"
+  },
+  "packageManager": "npm@10.9.3",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=22.20.0 <25.0.0",
+    "npm": ">=10.9.3 <12.0.0"
+  },
+  "dependencies": {
+    "@vscode/tree-sitter-wasm": "0.3.1",
+    "esbuild-wasm": "0.28.2"
+  },
+  "devDependencies": {
+    "conventional-changelog-cli": "^4.1.0",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# Install and maintain a per-user Session Kit installation.
+
+if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
+  for modern_bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [[ -x $modern_bash ]]; then
+      export PATH="${modern_bash%/*}:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+      exec "$modern_bash" "$0" "$@"
+    fi
+  done
+  printf '%s\n' 'session-kit: macOS needs Homebrew Bash 4 or newer. Install it with: brew install bash python rust' >&2
+  exit 69
+fi
+
+set -euo pipefail
+
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+program=${0##*/}
+install_root=${SESSION_KIT_ROOT:-"$HOME/.local/lib/session-kit"}
+bin_dir=${SESSION_KIT_BIN_DIR:-"$HOME/.local/bin"}
+config_root=${SESSION_KIT_CONFIG_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit"}
+state_root=${SESSION_KIT_STATE_DIR:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit"}
+claude_settings=${SESSION_KIT_CLAUDE_SETTINGS:-"${SESSION_KIT_CLAUDE_HOME:-"$HOME/.claude"}/settings.json"}
+codex_hooks=${SESSION_KIT_CODEX_HOOKS:-"${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-"$HOME/.codex"}}/hooks.json"}
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin)
+    service_root=${SESSION_KIT_SERVICE_ROOT:-${SESSION_KIT_LAUNCHD_ROOT:-"$HOME/Library/LaunchAgents"}}
+    ;;
+  *)
+    service_root=${SESSION_KIT_SERVICE_ROOT:-${SESSION_KIT_SYSTEMD_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user"}}
+    ;;
+esac
+# Session recordings. The kit writes nothing larger, and nothing ages them
+# out: they go when the session they belong to is closed or pruned.
+journal_dir=${SESSION_KIT_JOURNAL_DIR:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-journal"}
+bashrc_path=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
+# One completion file, installed under each command name that takes
+# arguments, in the directory bash-completion loads user files from. Set
+# SESSION_KIT_COMPLETION_DIR to none to skip installing them entirely.
+completion_dir=${SESSION_KIT_COMPLETION_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/bash-completion/completions"}
+completion_names=(sp session-kit shpool_status shpool_reaper codex_resume_here)
+completion_marker='# session-kit managed bash completion v1'
+bash_profile_path=${SESSION_KIT_BASH_PROFILE:-"$HOME/.bash_profile"}
+zshrc_path=${SESSION_KIT_ZSHRC:-"$HOME/.zshrc"}
+integration_marker=${SESSION_KIT_INTEGRATION_MARKER:-"$state_root/integration-ready-v1"}
+receipt_path=$state_root/install.json
+claude_statusline_backups=$state_root/claude-statusline-backups.json
+claude_integration_ledger=$state_root/claude-integration.json
+manager_link=$install_root/manager
+shpool_config=${XDG_CONFIG_HOME:-"$HOME/.config"}/shpool/config.toml
+login_start="# >>> session-kit managed integration >>>"
+login_end="# <<< session-kit managed integration <<<"
+helpers=(kit sp shpool_login shpool_login_tui shpool_login_launcher shpool_status shpool_reaper codex_resume_here)
+systemd_units=(
+  shpool.service
+  shpool.socket
+  shpool-reaper.service
+  shpool-reaper.timer
+  session-kit-subagent-sweep.service
+  session-kit-subagent-sweep.timer
+  session-kit-watchdog.service
+)
+# Long-running kit processes that hold their own code: bash keeps the inode it
+# exec'd, so one of these goes on running the release it started with until it
+# is restarted. Deliberately excludes shpool.service and shpool.socket --
+# restarting the session daemon ends every managed session.
+# Timers an update may enable when systemd has never heard of them. A new
+# timer that ships disabled is a rule that silently does not run.
+systemd_timer_units=(
+  session-kit-subagent-sweep.timer
+)
+systemd_restart_units=(
+  session-kit-watchdog.service
+)
+launchd_units=(
+  com.session-kit.shpool.plist
+  com.session-kit.reaper.plist
+  com.session-kit.watchdog.plist
+)
+launchd_restart_units=(
+  com.session-kit.watchdog.plist
+)
+launchd_template_root=$config_root/launchd
+launchd_receipt=$state_root/launchd-active.json
+common_required_commands=(
+  bash python3 shpool cmp cp find install mkdir mktemp mv pgrep ps rm script stat
+)
+inventory_files=(
+  lib/session_inventory.py
+  lib/sessionkit_inventory/__init__.py
+  lib/sessionkit_inventory/common.py
+  lib/sessionkit_inventory/lifecycle.py
+  lib/sessionkit_inventory/projects.py
+  lib/sessionkit_inventory/providers.py
+  lib/sessionkit_inventory/reaper.py
+  lib/sessionkit_inventory/state_io.py
+)
+shell_modules=(
+  lib/sh/session_kit_checks.sh
+  lib/sh/session_kit_doctor.sh
+  lib/sh/session_kit_install.sh
+  lib/sh/session_kit_lifecycle.sh
+  lib/sh/session_kit_login.sh
+  lib/sh/session_kit_projects.sh
+  lib/sh/session_kit_services.sh
+  lib/sh/session_kit_uninstall.sh
+  lib/sh/shpool_login_actions.sh
+  lib/sh/shpool_login_live.sh
+  lib/sh/shpool_login_projects.sh
+  lib/sh/shpool_login_recovery.sh
+  lib/sh/shpool_login_render.sh
+  lib/sh/shpool_login_theme.sh
+  lib/sh/shpool_login_view.sh
+  lib/sh/sp_commands.sh
+  lib/sh/sp_core.sh
+  lib/sh/sp_picker.sh
+  lib/sh/sp_provider_bounce.sh
+  lib/sh/sp_sessions.sh
+  lib/sh/sp_completion.bash
+)
+
+die() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+session-kit installs and maintains this machine's Session Kit installation.
+
+usage: session-kit <command> [arguments]
+
+Check and repair
+  session-kit doctor [--json]      check every installed part and report
+  session-kit services <enable|disable|status>
+                                   the user services: manager, reaper, watchdog
+
+Projects
+  session-kit projects <discover|import|list>
+                                   find, adopt, and show project shortcuts
+  session-kit projects add [ALIAS] /absolute/path
+                                   one entry per directory; which provider
+                                   opens it is chosen when a session starts
+  session-kit projects default ALIAS <claude|codex|shell|any>
+                                   what it opens with unless you name another
+  session-kit projects normalize   fold a directory listed twice into one entry
+  session-kit projects ignore /absolute/path
+  session-kit projects unignore /absolute/path
+  session-kit projects launch-plan [ALIAS]
+                                   what `sp new` would start there, and whether
+                                   its startup command is approved
+  session-kit projects approve-startup [ALIAS]
+                                   approve that project's startup command
+  session-kit projects check PATH  validate a session-kit.toml
+
+Releases
+  session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off] [--force]
+                                   install a newer release from a source tree
+  session-kit rollback [--to COMMIT]
+                                   return to a release already on this machine
+
+Login integration
+  session-kit enable-login         open the picker on interactive SSH logins
+  session-kit disable-login        stop opening it; sessions are untouched
+
+Removal
+  session-kit uninstall [--purge-code] [--purge-config]
+
+From a cloned repository:
+  ./install.sh --check
+  ./install.sh [--enable-login|--disable-login] [--journal on|off] [--force]
+               [--import-projects|--no-import-projects] [--non-interactive]
+
+The installer asks nothing. Login integration is on and history recording is
+off unless a flag says otherwise, and the install states what it chose.
+
+Day-to-day session commands are `sp`; run `sp help` for those, `sp help
+exit-codes` for the statuses every Session Kit command returns, and `sp help
+completion` for tab completion.
+
+Session Kit keeps session history and status data on this machine. It does
+not send telemetry. Uninstalling never deletes history.
+EOF
+}
+
+require_arg() {
+  [[ -n ${2:-} ]] || die "$1 requires a value"
+}
+
+platform() {
+  if [[ -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
+    [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+      die "SESSION_KIT_TEST_PLATFORM is reserved for isolated tests"
+    printf '%s\n' "$SESSION_KIT_TEST_PLATFORM"
+    return
+  fi
+  case "$(uname -s 2>/dev/null || true)" in
+    Linux) printf 'linux\n' ;;
+    Darwin) printf 'macos\n' ;;
+    *) printf 'unsupported\n' ;;
+  esac
+}
+
+transaction_path=$state_root/lifecycle-transaction.json
+# The eight Claude-palette names plus the six Codex-only ones, in the order
+# lib/sessionkit_inventory/colors.py declares them. Codex windows only ever
+# resolve one of the last six, but the first eight stay installed so a
+# rollback to a release that still assigns them finds its themes in place.
+codex_theme_names=(
+  red blue green yellow purple orange pink cyan
+  lime magenta silver sand sky sea
+)
+
+projects_created=0
+
+# Session Kit keeps its command modules beside this program. A Git checkout
+# and an installed release both hold them at ../lib/sh. The copy this program
+# installs into the binary directory has no sibling lib tree, so it falls back
+# to the release the current link already resolves to, which is the same code
+# this copy was installed from. Every module defines functions only, so
+# sourcing them here, after every global above is assigned, reproduces the
+# order the original single file used.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+module_dir=$script_dir/../lib/sh
+if [[ ! -r $module_dir/session_kit_checks.sh ]]; then
+  module_dir=
+  if [[ -e $transaction_path || -L $transaction_path ]]; then
+    recovery_release=$(python3 - "$transaction_path" "$install_root" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+journal = pathlib.Path(sys.argv[1])
+install_root = pathlib.Path(sys.argv[2])
+info = journal.lstat()
+if (
+    not stat.S_ISREG(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit("unsafe pending lifecycle transaction")
+try:
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid pending lifecycle transaction: {exc}")
+entries = payload.get("entries")
+if (
+    payload.get("schema_version") != 1
+    or payload.get("state") != "pending"
+    or not isinstance(entries, list)
+    or not entries
+    or not isinstance(entries[0], dict)
+    or entries[0].get("path") != os.fspath(install_root / "current")
+):
+    raise SystemExit("incompatible pending lifecycle transaction")
+current_before = entries[0]
+if current_before.get("kind") == "absent":
+    raise SystemExit(0)
+target_raw = current_before.get("target")
+if current_before.get("kind") != "symlink" or not isinstance(target_raw, str):
+    raise SystemExit("invalid pending current-release preimage")
+target = pathlib.Path(target_raw)
+release_root = install_root / "releases"
+try:
+    relative = target.relative_to(release_root)
+except ValueError:
+    raise SystemExit("pending recovery release is outside the install root")
+if len(relative.parts) != 1 or re.fullmatch(r"[0-9a-f]{40}", relative.name) is None:
+    raise SystemExit("pending recovery release is invalid")
+target_info = target.lstat()
+if (
+    not stat.S_ISDIR(target_info.st_mode)
+    or stat.S_ISLNK(target_info.st_mode)
+    or target_info.st_uid != os.geteuid()
+    or not (target / "lib/sh/session_kit_lifecycle.sh").is_file()
+):
+    raise SystemExit("pending recovery release is unavailable")
+print(target)
+PY
+    ) || die "pending lifecycle recovery release is unsafe"
+    if [[ -n $recovery_release ]]; then
+      module_dir=$recovery_release/lib/sh
+    fi
+    unset recovery_release
+  fi
+  [[ -n $module_dir ]] || module_dir=$install_root/current/lib/sh
+fi
+[[ -r $module_dir/session_kit_checks.sh ]] ||
+  die "shell modules are unavailable: $module_dir"
+# shellcheck source=lib/sh/session_kit_checks.sh
+source "$module_dir/session_kit_checks.sh"
+# shellcheck source=lib/sh/session_kit_lifecycle.sh
+source "$module_dir/session_kit_lifecycle.sh"
+# shellcheck source=lib/sh/session_kit_login.sh
+source "$module_dir/session_kit_login.sh"
+# shellcheck source=lib/sh/session_kit_projects.sh
+source "$module_dir/session_kit_projects.sh"
+# shellcheck source=lib/sh/session_kit_install.sh
+source "$module_dir/session_kit_install.sh"
+# shellcheck source=lib/sh/session_kit_doctor.sh
+source "$module_dir/session_kit_doctor.sh"
+# shellcheck source=lib/sh/session_kit_services.sh
+source "$module_dir/session_kit_services.sh"
+# shellcheck source=lib/sh/session_kit_uninstall.sh
+source "$module_dir/session_kit_uninstall.sh"
+
+command_name=${1:-help}
+shift || true
+case "$command_name" in
+  check)
+    source=
+    while (($#)); do
+      case "$1" in
+        --source) require_arg "$1" "${2:-}"; source=$2; shift 2 ;;
+        *) die "unknown check option: $1" ;;
+      esac
+    done
+    [[ -n $source ]] || die "check requires --source PATH"
+    check_source "$source"
+    ;;
+  install) install_command "$@" ;;
+  doctor) doctor_command "$@" ;;
+  projects)
+    [[ -L $install_root/current ]] || die "Session Kit is not installed"
+    projects_command "$@"
+    ;;
+  update) update_command "$@" ;;
+  rollback) rollback_command "$@" ;;
+  services) services_command "$@" ;;
+  enable-login) (($# == 0)) || die "enable-login takes no options"; enable_login ;;
+  disable-login) (($# == 0)) || die "disable-login takes no options"; disable_login ;;
+  uninstall) uninstall_command "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

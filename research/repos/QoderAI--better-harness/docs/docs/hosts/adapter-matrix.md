@@ -1,0 +1,173 @@
+---
+id: adapter-matrix
+title: Adapter Matrix
+sidebar_position: 1
+---
+
+# Host Adapter Matrix
+
+Better Harness runs inside your existing coding agent. Host differences enter
+only a thin adapter layer: host shells, configured-asset providers, session
+evidence adapters, and output modes. Canonical product judgment stays
+host-neutral.
+
+## Support levels
+
+Better Harness currently declares ten more complete capability-level host
+adapters plus one DSH session-only partial slice. Six have verified public
+Quickstart paths. Pi, Kimi Code, WorkBuddy, and Grok are visible as adapter
+support because their installation and end-to-end evidence boundaries differ
+from that six-host set. DSH is visible only as a developer-preview session
+evidence contract, not as a runnable report adapter. The [canonical adapter matrix](https://github.com/QoderAI/better-harness/blob/main/docs/adapters/README.md)
+remains the complete capability-level source of truth.
+
+## Supported host adapters
+
+| Host | Public entry | Positioning | Shell | Session Evidence | Default Output |
+| --- | --- | --- | --- | --- | --- |
+| Qoder | Verified Quickstart | First-class product host | `.qoder-plugin/` | Qoder sessions | Qoder Canvas report |
+| Claude Code | Verified Quickstart | Analysis-capable source-local host | `.claude-plugin/` | Workspace-matching local Claude transcripts when present | Self-contained HTML + Markdown |
+| Codex | Verified Quickstart | Analysis-capable source-local host | `.codex-plugin/` | Codex sessions | Self-contained HTML + Markdown |
+| Cursor | Verified Quickstart | Canvas-capable source-local host | `.cursor-plugin/` | Workspace-matched transcripts, metadata, audit logs, and optional native Context Usage snapshots; partial coverage stays explicit | Cursor Canvas report |
+| Qwen Code | Verified Quickstart | Analysis-capable source-local host | `qwen-extension.json` | Workspace-matching local Qwen transcripts when present | Self-contained HTML + Markdown |
+| GitHub Copilot | Verified Quickstart | Analysis-capable source-local host | `.github/plugin/` | Workspace-matched Copilot CLI transcripts; partial coverage stays explicit | Self-contained HTML + Markdown |
+| Pi | Adapter support | Analysis-capable source-local host | `pi` manifest in `package.json` | Workspace-matching local Pi sessions | Self-contained HTML + Markdown |
+| Kimi Code | Adapter support | Analysis-capable source-local host | `.kimi-plugin/plugin.json` | Workspace-matching Kimi wire transcripts | Self-contained HTML + Markdown |
+| WorkBuddy | Adapter support | Analysis-capable source-local host | None; skills use WorkBuddy-owned paths | Workspace-matching WorkBuddy JSONL transcripts | Self-contained HTML + Markdown |
+| Grok | Adapter support | Analysis-capable source-local host | None; skills use Grok-owned paths | Workspace-matching Grok session dirs (`updates.jsonl`) | Self-contained HTML + Markdown |
+| DeepSeek Harness (DSH) | Session analysis only | Partial, developer-preview contract | None | DSH JSONL backend session format `0`: raw `.jsonl` and feature-detected `.jsonl.zstd` | Unavailable |
+
+The `@qoder-ai/better-harness` npm package includes all seven plugin metadata
+roots. Pi reuses install metadata in the existing `package.json`, so it does
+not add an eighth filesystem metadata root. The generated Qoder runtime bundle
+includes only the Qoder shell; non-Qoder generated host artifacts remain
+source-local.
+
+## Read-only plugin lifecycle
+
+The standalone CLI can normalize local Better Harness installation evidence
+without flattening host capability differences:
+
+```bash
+better-harness plugin status --host all
+better-harness plugin verify --host all
+better-harness doctor --platform all
+```
+
+`plugin plan` requires one explicit host and emits typed native argv or manual
+steps without executing them. Qoder Desktop remains bundled, Codex Desktop uses
+manual UI steps, Cursor installation stays unavailable while its local help
+contract is stale, persistent Pi operations without native evidence stay
+unavailable, transient Pi update/remove are not applicable, and WorkBuddy
+returns `PLUGIN_LIFECYCLE_UNSUPPORTED`. Kimi Code and Grok have no validated
+native lifecycle contract yet, so lifecycle targets reject them with
+`UNKNOWN_HOST` while their adapter evidence stays available. DSH likewise has
+no lifecycle profile: lifecycle targets reject it with `UNKNOWN_HOST`, and only
+its partial session evidence remains available. The shadow host
+profiles do not replace the canonical adapter matrix while ADR-0002 remains
+proposed.
+
+## Output modes
+
+- **Qoder Canvas** — renderer-owned `findings.json`, Canvas-only
+  `canvas.json`, and `report.canvas.tsx`.
+- **Cursor Canvas** — the same complete report contract rendered with
+  `cursor/canvas`, native Context Window evidence, and IDE actions.
+- **HTML visual** — portable Claude Code/Codex/Qwen/Copilot/Pi/Kimi Code/WorkBuddy/Grok contract
+  covering `findings.json`, `report.md`, and a self-contained `report.html`
+  (see the [sample report](pathname:///demo/better-harness-report/)).
+- **Markdown-only** — no visual companion.
+
+DSH is not an output-mode host. Session-analysis evidence does not grant HTML,
+Canvas, Markdown, or any report route.
+
+## Adapter support boundaries
+
+### Pi {#pi}
+
+Pi can install the repository through `pi install <source>` or load it with
+`pi -e <source>`. Lifecycle status treats persisted user/project package
+settings as the `cli` inventory surface and one-run `pi -e` activation as the
+separate `cli-session` session-only surface; empty settings do not prove that a
+running session omitted the package. Package discovery, configured assets,
+workspace-matched session evidence, and portable HTML routing are implemented.
+Pi remains outside the verified Quickstart set until a complete interactive
+report-loop smoke is observed.
+
+### Kimi Code {#kimi-code}
+
+Kimi Code installs the repository through `/plugins install <source>` and the
+`.kimi-plugin/plugin.json` manifest, then invokes `/skill:better-harness` after
+reload. Configured assets, workspace-matched wire transcripts, and portable HTML
+routing are implemented. Kimi Code remains outside the verified Quickstart set
+until a complete interactive report-loop smoke is observed.
+
+### WorkBuddy {#workbuddy}
+
+WorkBuddy configured assets, workspace-matched session evidence, and portable
+HTML routing are implemented. This repository does not ship a WorkBuddy install
+shell, plugin manifest, or npm-packaged host artifact; installation remains on
+WorkBuddy's own `~/.workbuddy/skills` or marketplace surfaces.
+
+### Grok {#grok}
+
+Grok configured assets, workspace-matched session evidence, and portable HTML
+routing are implemented. This repository does not ship a Grok install shell or
+npm-packaged host artifact; installation is a manual skill symlink into
+`~/.grok/skills/better-harness` (or project `.grok/skills`). Grok remains
+outside the verified Quickstart set until a complete interactive report-loop
+smoke is observed.
+
+### DeepSeek Harness (DSH) {#deepseek-harness-dsh}
+
+DSH coverage is a developer-preview, JSONL-only session slice, with Better
+Harness adapter metadata `dsh-v1` and native session format `0` pinned to DSH
+`dsh-v0.1.0-rc.7`. Home resolution is strictly `--dsh-home` over `DSH_HOME`
+over `~/.dsh`; the only source root is `<home>/sessions`. The adapter reads the
+fixed nested `session.jsonl` or `session.jsonl.zstd` layout without writing or
+repairing artifacts, and it qualifies a workspace only from the header's
+absolute `cwd`. DSH is registered only for the `sessionAnalysis` capability.
+
+Compressed artifacts are concatenated independently checksummed Zstandard
+frames and are validated and decompressed one complete frame at a time. The
+public API available in supported Node.js 22.20 and 24 runtimes is
+feature-detected. When it is unavailable, including Node.js 23.0 through 23.7,
+compressed evidence is reported unavailable while independent raw JSONL
+evidence remains readable; no fallback dependency is installed.
+Known-but-unsupported and unknown ignorable events are accounted
+for, while unknown required events, malformed data, identity drift, and
+unsupported versions fail closed. Open trailing turns remain incomplete, and
+the adapter does not infer plugin ownership, causality, or faults.
+
+The implemented source-checkout smoke boundary is read-only:
+
+```bash
+node scripts/session-analysis.mjs sources --platform dsh --workspace <path> [--dsh-home <dir>]
+```
+
+This is not evidence of native DSH installation or invocation. DSH has no live
+PTY/process integration, configured-asset or Skill discovery, plugin lifecycle,
+shell, manifest, package integration, report/output route, README Quickstart or
+Installation path, SQLite or custom persistence support, automatic
+optimization, plugin-fault attribution, or artifact mutation/recovery. See the
+[canonical source matrix](https://github.com/QoderAI/better-harness/blob/main/docs/adapters/README.md)
+and [Story #93](https://github.com/QoderAI/better-harness/issues/93).
+
+## Capability coverage
+
+Capabilities differ per host on purpose: no host claims a capability without a
+real evidence source, and unsupported behavior fails before reading private
+data or changing files. The maintained capability-by-capability coverage
+table, TODO list, and definition of done live in the repository
+[roadmap](https://github.com/QoderAI/better-harness/blob/main/roadmap.md).
+
+## Source of truth
+
+The canonical matrix, discovery rules, and split triggers live in
+[`docs/adapters/README.md`](https://github.com/QoderAI/better-harness/blob/main/docs/adapters/README.md).
+
+## Contributing another host
+
+Start with [Contributing a Coding Agent Host](./contributing-new-coding-agent.md).
+It separates native shell, configured-asset, session, output, and packaging
+claims and links Qwen Code and GitHub Copilot pull requests as worked examples.

@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a reproducible Better Harness defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Share the shortest path to the observable problem; maintainers can ask for deeper diagnostics later.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the failure in one or two sentences.
+      placeholder: The report command fails when ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Where did it happen?
+      description: Pick the closest host or runtime.
+      options:
+        - Claude Code
+        - Codex
+        - Qoder
+        - Cursor
+        - Qwen Code
+        - GitHub Copilot
+        - Pi
+        - Standalone CLI
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment
+      description: Include the Better Harness version if known, plus OS or install source when relevant.
+      placeholder: x.y.z on macOS via npm, or unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the command, file, or project state needed to see the issue.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected vs actual result
+      description: Tell us what you expected and what happened instead.
+      placeholder: |
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste the smallest useful error, test output, report excerpt, or screenshot link.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Anything else?
+      description: Add regressions, workarounds, frequency, or other context if it helps triage.

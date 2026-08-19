@@ -1,0 +1,9 @@
+[Unit]
+Description=shpool session daemon socket
+
+[Socket]
+ListenStream=%t/shpool/shpool.socket
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

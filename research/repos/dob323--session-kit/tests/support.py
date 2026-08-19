@@ -1,0 +1,409 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tarfile
+import tempfile
+from typing import Iterable
+
+# Re-exported so a fixture never has to know where the guard lives. The guard
+# itself is armed from tests/__init__.py, before any of this runs; these are the
+# pieces a fixture reaches for when it wants to RECORD shpool calls and assert
+# on them, rather than only be stopped from making them.
+from tests.sandbox_guard import (  # noqa: F401
+    guarded_environment,
+    install_recording_shpool,
+    private_daemon_name,
+    recorded_shpool_calls,
+    unexpected_shpool_calls,
+    without_shpool,
+)
+
+
+REPO = Path(__file__).resolve().parents[1]
+
+# The only dotted entries at the repository root that ARE the source. Anything
+# else dotted up there is a fixture's sandbox or a build cache.
+SOURCE_ROOT_DOTTED = frozenset({".github", ".gitignore", ".shellcheckrc"})
+
+
+def source_tree_ignore(root: Path = REPO):
+    """What a copy of this checkout must leave behind.
+
+    Three tests copy the source tree, and all three used to name what to skip:
+    `.git`, the caches, `__pycache__`. None of them skipped the fixtures'
+    sandboxes, which are built inside the checkout on purpose to keep AF_UNIX
+    paths short and which come and go in seconds. Copy the tree while a sibling
+    test removes one and copytree lists an entry, then fails to open it, and the
+    run dies over a file that was never part of the source.
+
+    c9d85e9 fixed that in one of the three by borrowing the sweep's list of
+    sandbox prefixes. Six were named against the two hundred and more the suite
+    hands tempfile, so the fix covered neither of the two sandboxes that have
+    actually broken a run. Prefixes were never the right shape here.
+
+    tests/sweep_sandboxes.py no longer carries a list -- it reads the prefixes
+    out of the test sources -- and this rule still does not borrow from it. A
+    copy rule and a delete rule disagree about `.git`: the copy must drop it,
+    the sweep must protect it. Two answers, two constants, no shared edit.
+
+    .gitignore settled this for Git already -- `/.*/` with `!/.github/`, under
+    the note "Ignore the whole class rather than chase prefixes" -- so this
+    applies that same rule at the root: every dotted entry goes except the ones
+    that really are source. Nothing about deeper directories changes, where a
+    dotted name is ordinary content.
+    """
+    root = Path(root).resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        dropped = {
+            name for name in names if name == "__pycache__" or name.endswith(".pyc")
+        }
+        if Path(directory).resolve() == root:
+            dropped |= {
+                name
+                for name in names
+                if name.startswith(".") and name not in SOURCE_ROOT_DOTTED
+            }
+        return dropped
+
+    return ignore
+
+
+RELEASE_TOOL = REPO / "deploy" / "session-kit-release"
+HELPERS = (
+    "sp",
+    "shpool_login",
+    "shpool_login_tui",
+    "shpool_login_launcher",
+    "shpool_status",
+    "shpool_reaper",
+    "codex_resume_here",
+)
+# Both palettes: the eight names Claude Code's /color accepts and the six
+# Codex-only ones, in palette order. Mirrors bin/session-kit's
+# codex_theme_names, and tests/test_session_colors.py asserts it still equals
+# the palette the runtime declares.
+THEME_COLORS = (
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "purple",
+    "orange",
+    "pink",
+    "cyan",
+    "lime",
+    "magenta",
+    "silver",
+    "sand",
+    "sky",
+    "sea",
+)
+
+# Suite-wide sandbox belt: harness subprocesses inherit this environment, and
+# any real bin script they run would otherwise auto-title the developer's live
+# Codex threads through the snapshot hook. Tests of the titler itself pass an
+# explicit environ without this key, so the feature stays fully tested.
+os.environ.setdefault("SESSION_KIT_CODEX_AUTOTITLE", "0")
+
+
+def run(
+    argv: Iterable[os.PathLike[str] | str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged = os.environ.copy()
+    merged["PYTHONDONTWRITEBYTECODE"] = "1"
+    if env:
+        merged.update(env)
+    proc = subprocess.run(
+        [os.fspath(v) for v in argv],
+        cwd=cwd,
+        env=merged,
+        input=input_text,
+        # A child with no input of its own must not inherit the runner's
+        # stdin. Whether stdin is a terminal is a BRANCH in the shipped code:
+        # every `[[ ! -t 0 ]]` site takes a different path for a person than
+        # for a script, and sk_confirm_exact (session_kit_common, the person
+        # branch that announces and acts vs the scripted branch that requires
+        # an exact SESSION_KIT_CONFIRM_ID) is the one that bit. Inheriting
+        # made the launcher pick the branch the assertion measured -- green
+        # through a pipe, red from a terminal, with the test unchanged.
+        # DEVNULL is the same not-a-terminal a pipe already gave, chosen here
+        # instead of inherited. `stdin=None` when `input` is used keeps
+        # subprocess's own "stdin and input may not both be used" check happy.
+        stdin=subprocess.DEVNULL if input_text is None else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and proc.returncode:
+        raise AssertionError(
+            f"command failed ({proc.returncode}): {list(argv)!r}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def git(repo: Path, *args: str) -> str:
+    return run(["git", *args], cwd=repo).stdout.strip()
+
+
+def make_git_repo(base: Path, version: str = "v1") -> tuple[Path, str]:
+    repo = base / "source"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Session Kit Tests")
+    git(repo, "config", "user.email", "tests@example.invalid")
+    write_runtime(repo, version)
+    git(
+        repo,
+        "add",
+        "bin",
+        "lib",
+        "bashrc",
+        "config",
+        "deploy",
+        "shpool",
+        "README.md",
+    )
+    git(repo, "commit", "-qm", f"runtime {version}")
+    return repo, git(repo, "rev-parse", "HEAD")
+
+
+def write_runtime(repo: Path, version: str) -> str:
+    bindir = repo / "bin"
+    bindir.mkdir(exist_ok=True)
+    for helper in HELPERS:
+        path = bindir / helper
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s:%s' {version!r} \"${{0##*/}}\"\n"
+            "printf ':%s' \"$@\"\n"
+            "printf '\\n'\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+    common = bindir / "session_kit_common"
+    common.write_text("# fixture shared shell helpers\n", encoding="utf-8")
+    common.chmod(0o644)
+    (repo / "README.md").write_text(f"fixture {version}\n", encoding="utf-8")
+    required = {
+        "lib/session_inventory.py": "# fixture inventory\n",
+        "lib/sessionkit_inventory/__init__.py": "# fixture package\n",
+        "lib/sessionkit_inventory/colors.py": "# fixture color helpers\n",
+        "lib/sessionkit_inventory/common.py": "# fixture common helpers\n",
+        "lib/sessionkit_inventory/lifecycle.py": "# fixture lifecycle helpers\n",
+        "lib/sessionkit_inventory/projects.py": "# fixture project helpers\n",
+        "lib/sessionkit_inventory/providers.py": "# fixture provider helpers\n",
+        "lib/sessionkit_inventory/state_io.py": "# fixture state helpers\n",
+        "bashrc/shpool.bashrc": "# fixture bashrc\n",
+        "config/projects.example.tsv": "# alias\tprovider\tcwd\n",
+        "config/session-inventory.example.json": '{"schema_version":1}\n',
+        "config/shpool.example.toml": (
+            'session_restore_mode = "simple"\n'
+            "output_spool_lines = 1000\n"
+            "vt100_output_spool_width = 200\n"
+        ),
+        "shpool/config.toml": (
+            'session_restore_mode = "simple"\n'
+            "output_spool_lines = 1000\n"
+            "vt100_output_spool_width = 200\n"
+        ),
+    }
+    for relative, content in required.items():
+        path = repo / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    deploy_dir = repo / "deploy"
+    deploy_dir.mkdir(exist_ok=True)
+    launcher = deploy_dir / "session-kit-launcher"
+    launcher.write_text(
+        (REPO / "deploy/session-kit-launcher").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return version
+
+
+def commit_runtime(repo: Path, version: str) -> str:
+    write_runtime(repo, version)
+    git(repo, "add", "bin", "lib", "bashrc", "config", "deploy", "README.md")
+    git(repo, "commit", "-qm", f"runtime {version}")
+    return git(repo, "rev-parse", "HEAD")
+
+
+def make_backup_bundle(
+    base: Path,
+    canonical_head: str,
+    *,
+    home_prefix: str = "home/sessionuser",
+) -> Path:
+    bundle = base / "backup"
+    bundle.mkdir(parents=True)
+    payloads = {
+        "bundle.sha256": b"fixture bundle digest\n",
+        "canonical-state.txt": f"head={canonical_head}\nstatus_entries=0\n".encode(),
+        "current-identities.json": b'{"schema_version":1,"sessions":[]}\n',
+        "shpool-list.json": b'{"sessions":[]}\n',
+    }
+    run(
+        [
+            "git",
+            "bundle",
+            "create",
+            bundle / "canonical-head.bundle",
+            "--all",
+        ],
+        cwd=base / "source",
+    )
+    installed = bundle / "installed-files.tar"
+    with tarfile.open(installed, mode="w") as archive:
+        for name in (
+            f"{home_prefix}/.local/bin/shpool_login",
+            f"{home_prefix}/.local/bin/shpool_login_tui",
+            f"{home_prefix}/.local/bin/shpool_login_launcher",
+            f"{home_prefix}/.local/bin/shpool_reaper",
+            f"{home_prefix}/.local/bin/shpool_status",
+            f"{home_prefix}/.local/bin/sp",
+            f"{home_prefix}/.local/bin/codex_resume_here",
+            f"{home_prefix}/.bashrc",
+            f"{home_prefix}/.config/shpool/config.toml",
+            f"{home_prefix}/.config/systemd/user/shpool.service",
+            f"{home_prefix}/.config/systemd/user/shpool.socket",
+            f"{home_prefix}/.config/systemd/user/shpool-reaper.service",
+            f"{home_prefix}/.config/systemd/user/shpool-reaper.timer",
+        ):
+            source = bundle / ".tar-source"
+            source.write_text(f"{name}\n", encoding="utf-8")
+            source.chmod(0o755 if "/.local/bin/" in name else 0o644)
+            archive.add(source, arcname=name, recursive=False)
+    (bundle / ".tar-source").unlink()
+    checksum_lines: list[str] = []
+    stat_lines: list[str] = []
+    with tarfile.open(installed, mode="r:") as archive:
+        for member in archive:
+            extracted = archive.extractfile(member)
+            assert extracted is not None
+            content = extracted.read()
+            checksum_lines.append(
+                f"{hashlib.sha256(content).hexdigest()}  {member.name}\n"
+            )
+            stat_lines.append(
+                f"{member.mode & 0o777:o}\\t{member.uid}\\t{member.gid}"
+                f"\\t{member.size}\\t1\\t2020-01-01 00:00:00 +0000"
+                f"\\t{member.name}\n"
+            )
+    payloads["source-files.before.sha256"] = "".join(checksum_lines).encode()
+    payloads["source-files.after.sha256"] = "".join(checksum_lines).encode()
+    payloads["source-files.stat"] = "".join(stat_lines).encode()
+    for name, content in payloads.items():
+        (bundle / name).write_bytes(content)
+    payload_names = sorted([*payloads, "canonical-head.bundle", "installed-files.tar"])
+    manifest = bundle / "MANIFEST.sha256"
+    manifest.write_text(
+        "".join(
+            f"{hashlib.sha256((bundle / name).read_bytes()).hexdigest()}  {name}\n"
+            for name in payload_names
+        ),
+        encoding="utf-8",
+    )
+    marker = {
+        "schema_version": 1,
+        "complete": True,
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "source": "session-kit-predeploy",
+        "canonical_head": canonical_head,
+        "manifest": "MANIFEST.sha256",
+        "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        "manifest_scope": (
+            "all regular payload files except MANIFEST.sha256 and BACKUP_COMPLETE.json"
+        ),
+    }
+    (bundle / "BACKUP_COMPLETE.json").write_text(
+        json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return bundle
+
+
+def make_sentinels(home: Path) -> None:
+    for name in (".no_shpool", ".no_shpool_reaper"):
+        (home / name).write_text("", encoding="utf-8")
+
+
+def json_stdout(proc: subprocess.CompletedProcess[str]) -> dict:
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"not JSON: {proc.stdout!r}") from exc
+
+
+class IsolatedTree:
+    def __init__(self) -> None:
+        # Some supported hosts mount /tmp noexec. Release launch tests need to
+        # execute immutable fixture helpers, so keep the disposable tree on the
+        # repository's executable filesystem.
+        self.temp = tempfile.TemporaryDirectory(prefix=".session-kit-test-", dir=REPO)
+        self.base = Path(self.temp.name)
+        self.home = self.base / "home"
+        self.home.mkdir(mode=0o700)
+        self.root = self.home / ".local/lib/session-kit"
+        self.release_root = self.root / "releases"
+        self.bin_dir = self.home / ".local/bin"
+        self.state_dir = self.home / ".local/state/session-kit/deploy"
+
+    def close(self) -> None:
+        self.temp.cleanup()
+
+    def build(self, repo: Path, sha: str) -> Path:
+        run(
+            [
+                RELEASE_TOOL,
+                "build",
+                "--repo",
+                repo,
+                "--sha",
+                sha,
+                "--release-root",
+                self.release_root,
+            ]
+        )
+        return self.release_root / sha
+
+    def activation_args(self, sha: str, backup: Path) -> list[os.PathLike[str] | str]:
+        proof = self.state_dir / f"integration-proof-{sha}"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text(f"session-kit-integration-v1 {sha}\n", encoding="utf-8")
+        proof.chmod(0o600)
+        return [
+            "--commit",
+            sha,
+            "--backup-bundle",
+            backup,
+            "--root",
+            self.root,
+            "--home",
+            self.home,
+            "--bin-dir",
+            self.bin_dir,
+            "--state-dir",
+            self.state_dir,
+            "--integration-marker",
+            self.state_dir.parent / "integration-ready-v1",
+            "--integration-proof",
+            proof,
+        ]
+
+
+def file_mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)

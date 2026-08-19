@@ -1,0 +1,356 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  # Branch runs share one group and supersede each other, which saves runner
+  # time on a busy branch. Default-branch runs get a group of their own per
+  # run, so they neither cancel nor queue behind anything: the badge reads
+  # the newest default-branch run, GitHub draws both cancelled AND queued-
+  # then-superseded runs as failing, and several pushes an hour apart left
+  # the project looking broken while every job that ran had passed.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.run_id || 'branch' }}
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+        python:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+        exclude:
+          # Every 3.12.x build in the ubuntu-24.04 toolcache ships a _curses
+          # extension built against a newer CPython (undefined symbol
+          # _PySys_GetOptionalAttrString), which kills every TUI test; the
+          # ubuntu-22.04 3.12 build is healthy and keeps the version covered.
+          # Restore this cell when the 24.04 toolcache is repaired.
+          - os: ubuntu-24.04
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check Bash syntax
+        run: |
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          bash -n "${shell_scripts[@]}" bashrc/shpool.bashrc
+      - name: Check scripts embedded in heredocs
+        run: tools/check-embedded-scripts
+      - name: Check public working tree
+        run: tools/public-scan .
+      - name: Run tests
+        run: tests/run
+
+  macos:
+    name: macOS ${{ matrix.arch }} / Python 3.13
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Install supported Bash
+        run: |
+          # A runner image can arrive with a third-party tap Homebrew refuses
+          # to trust, and `brew install` then exits nonzero over a tap this
+          # job never asked for. Untrusted taps are removed first so the
+          # install speaks only about Bash.
+          for tap in $(brew tap 2>/dev/null); do
+            case "$tap" in homebrew/*) continue ;; esac
+            brew untap "$tap" 2>/dev/null || true
+          done
+          brew install bash || brew list bash
+          modern_bash="$(brew --prefix bash)/bin/bash"
+          test -x "$modern_bash"
+          printf 'SESSION_KIT_TEST_BASH=%s\n' "$modern_bash" >> "$GITHUB_ENV"
+          printf '%s\n' "${modern_bash%/*}" >> "$GITHUB_PATH"
+      - name: Verify native Darwin adapter
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test -n "$(python3 lib/session_inventory.py platform boot-id)"
+          "$SESSION_KIT_TEST_BASH" -c '
+            set -euo pipefail
+            info=$(python3 lib/session_inventory.py platform process-info $$)
+            generation=${info#*$'"'"'\t'"'"'}
+            test "$generation" -gt 0
+            python3 lib/session_inventory.py platform process-is \
+              $$ "$generation" bash
+            # Keep Bash from replacing itself with the final Python command;
+            # the process-is check must still observe the shell at this PID.
+            :
+          '
+      - name: Check supported Bash syntax
+        run: |
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          "$SESSION_KIT_TEST_BASH" -n "${shell_scripts[@]}" bashrc/shpool.bashrc
+      - name: Check scripts embedded in heredocs
+        run: tools/check-embedded-scripts
+      - name: Run native and fixture-only macOS tests
+        run: |
+          python3 -m unittest -v \
+            tests.test_macos_preview \
+            tests.test_install.InstallerTests.test_macos_install_update_and_rollback_are_transactional \
+            tests.test_login \
+            tests.test_lifecycle_shell.ProviderExitShellTests \
+            tests.test_lifecycle_shell.TimeoutPipelineTests \
+            tests.test_provider_title_push.ClaudeAiTitleTests \
+            tests.test_inventory.WorkerLaunchGateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
+            tests.test_projects \
+            tests.test_projects_context \
+            tests.test_projects_identity \
+            tests.test_projects_manifest \
+            tests.test_public_export \
+            tests.test_release_artifact \
+            tests.test_public_scan \
+            tests.test_doc_links
+
+  quality:
+    name: Quality, privacy, and public export
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Install quality tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          python -m pip install --requirement requirements-dev.txt
+      - name: Check shell
+        run: |
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          shellcheck "${shell_scripts[@]}" bashrc/shpool.bashrc
+      - name: Check Python
+        env:
+          RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
+        run: |
+          ruff --version
+          ruff check --output-format github .
+          ruff check --output-format github \
+            tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/check-embedded-scripts \
+            tools/public-scan tools/render-readme-picker \
+            deploy/session-kit-release
+          ruff format --check lib/sessionkit_inventory/__init__.py \
+            lib/sessionkit_inventory/collector.py \
+            lib/sessionkit_inventory/closed_sessions.py \
+            lib/sessionkit_inventory/colors.py \
+            lib/sessionkit_inventory/common.py \
+            lib/sessionkit_inventory/lifecycle.py \
+            lib/sessionkit_inventory/migration.py \
+            lib/sessionkit_inventory/model.py \
+            lib/sessionkit_inventory/names.py \
+            lib/sessionkit_inventory/names_push.py \
+            lib/sessionkit_inventory/origins.py \
+            lib/sessionkit_inventory/private_store.py \
+            lib/sessionkit_inventory/processes.py \
+            lib/sessionkit_inventory/projects.py \
+            lib/sessionkit_inventory/providers.py \
+            lib/sessionkit_inventory/providers_claude.py \
+            lib/sessionkit_inventory/providers_codex.py \
+            lib/sessionkit_inventory/reaper.py \
+            lib/sessionkit_inventory/recovery.py \
+            lib/sessionkit_inventory/render.py \
+            lib/sessionkit_inventory/self_name.py \
+            lib/sessionkit_inventory/snapshot.py \
+            lib/sessionkit_inventory/terminal.py \
+            lib/sessionkit_inventory/transcripts.py \
+            lib/sessionkit_inventory/validation.py \
+            lib/sessionkit_inventory/worker_model.py \
+            lib/sessionkit_inventory/worktrees.py \
+            lib/sessionkit_projects/__init__.py \
+            lib/sessionkit_projects/cli.py \
+            lib/sessionkit_projects/context.py \
+            lib/sessionkit_projects/identity.py \
+            lib/sessionkit_projects/launch.py \
+            lib/sessionkit_projects/manifest.py \
+            tests/test_doc_links.py tests/test_facade.py \
+            tests/test_projects.py \
+            tests/test_projects_context.py \
+            tests/test_projects_identity.py \
+            tests/test_projects_manifest.py \
+            tests/test_public_export.py tests/test_public_scan.py \
+            tests/test_release_artifact.py tests/support.py \
+            tests/test_sandbox_sweep.py \
+            tests/shard.py \
+            tests/test_readme_art.py tests/test_readme_keys.py \
+            tools/readme_art_lib.py tools/readme_keys.py
+          ruff format --check tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/check-embedded-scripts tools/public-scan \
+            tools/readme_art_lib.py tools/readme_capture.py tools/readme_keys.py \
+            tools/render-readme-figures tools/render-readme-picker \
+            tools/render-readme-social
+          python -m compileall -q lib tests
+          python -m py_compile tools/build-public-tree \
+            tools/build-release-artifact tools/check-doc-links \
+            tools/check-embedded-scripts tools/public-scan \
+            tools/render-readme-figures tools/render-readme-picker \
+            tools/render-readme-social deploy/session-kit-release
+      - name: Check types
+        env:
+          MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
+        run: |
+          mypy --ignore-missing-imports \
+            lib/session_inventory.py lib/sessionkit_inventory \
+            lib/sessionkit_projects
+          # Extensionless scripts have no module name to infer, so they need
+          # --scripts-are-modules. tools/render-readme-picker is excluded:
+          # it imports the login test fixture, which pulls the whole test tree
+          # into the type check.
+          mypy --ignore-missing-imports --scripts-are-modules \
+            tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/check-embedded-scripts \
+            tools/public-scan deploy/session-kit-release
+      - name: Check documentation links
+        run: tools/check-doc-links
+      - name: Scan working tree and reachable history
+        run: |
+          tools/public-scan .
+          if [[ -f SOURCE.json ]]; then
+            # Commits published before the private-marker rule existed cannot
+            # be rewritten out of a public history. tools/public-scan-history-baseline
+            # names the reviewed blobs; every other blob still fails.
+            tools/public-scan . --git-history --private-markers \
+              --baseline tools/public-scan-history-baseline
+          else
+            tools/public-scan . --git-history
+          fi
+      - name: Build and test exact public export
+        env:
+          # One process per module, four at a time. This suite is bounded by
+          # wall clock rather than by processors -- most of its expensive
+          # modules sit in a pty waiting for a picker to repaint -- so four
+          # workers finish the same 2,728 tests in a quarter of the time on
+          # this runner's four cores just as they do on thirty-two. Measured
+          # 2026-08-18: 1,588 s serial, 395 s here, floor 393 s because
+          # test_watchdog alone takes that long.
+          SESSION_KIT_TEST_WORKERS: "4"
+        run: |
+          tools/build-public-tree \
+            --commit "$GITHUB_SHA" \
+            --destination "$RUNNER_TEMP/session-kit-public"
+          git -C "$RUNNER_TEMP/session-kit-public" init --quiet
+          git -C "$RUNNER_TEMP/session-kit-public" config \
+            user.name "Session Kit CI"
+          git -C "$RUNNER_TEMP/session-kit-public" config \
+            user.email "ci@example.invalid"
+          git -C "$RUNNER_TEMP/session-kit-public" add .
+          git -C "$RUNNER_TEMP/session-kit-public" commit \
+            --quiet --message "Public export under test"
+          "$RUNNER_TEMP/session-kit-public/tests/run"
+      - name: Build reproducible release preparation files
+        run: |
+          tools/build-release-artifact \
+            --commit "$GITHUB_SHA" \
+            --output-dir "$RUNNER_TEMP/artifacts-one"
+          tools/build-release-artifact \
+            --commit "$GITHUB_SHA" \
+            --output-dir "$RUNNER_TEMP/artifacts-two"
+          diff -qr "$RUNNER_TEMP/artifacts-one" "$RUNNER_TEMP/artifacts-two"
+          cd "$RUNNER_TEMP/artifacts-one"
+          sha256sum --check session-kit-"$GITHUB_SHA".sha256
+      - name: Enforce tested Python coverage
+        env:
+          COVERAGE_FILE: ${{ runner.temp }}/coverage
+        run: |
+          # Every worker gets its own data file (--parallel-mode inside the
+          # driver), and `combine` merges them into COVERAGE_FILE before the
+          # threshold is applied -- so the number below is the whole suite's,
+          # exactly as it was when one process walked every module.
+          python tests/shard.py --workers 4 --coverage
+          coverage combine
+          coverage report --skip-empty --fail-under=70
+
+  shpool-patch:
+    name: Optional shpool patches apply, test, and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install shpool test shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh
+      - name: Check patches against shpool 0.11.0
+        run: |
+          git clone --branch v0.11.0 --depth 1 \
+            https://github.com/shell-pool/shpool.git \
+            "$RUNNER_TEMP/shpool"
+          test "$(git -C "$RUNNER_TEMP/shpool" rev-parse HEAD)" = \
+            fe2d11595ff255810523b0868159dec051e303f1
+          for patch in \
+            0001-heartbeat-ack-timeout-is-not-fatal.patch \
+            0002-restore-input-modes-on-reattach.patch \
+            0003-kill-tolerates-an-already-dead-shell.patch \
+            0004-detach-must-not-hold-the-shells-lock.patch \
+            0005-attach-must-not-discard-the-shells-exit-status.patch \
+            0006-coalesce-client-resize-bursts.patch; do
+            git -C "$RUNNER_TEMP/shpool" apply --check \
+              "$GITHUB_WORKSPACE/shpool-patch/$patch"
+            git -C "$RUNNER_TEMP/shpool" apply \
+              "$GITHUB_WORKSPACE/shpool-patch/$patch"
+          done
+          cargo test --locked --manifest-path \
+            "$RUNNER_TEMP/shpool/Cargo.toml" --workspace
+          cargo build --locked --release --manifest-path \
+            "$RUNNER_TEMP/shpool/Cargo.toml" --bin shpool

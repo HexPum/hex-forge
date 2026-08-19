@@ -1,0 +1,497 @@
+"""The `agentacct receipt` / `agentacct receipts` CLI — the acceptance vehicle."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from agentacct.cli import app
+from agentacct.receipt import RECEIPT_SCHEMA_VERSION
+from agentacct.service import SentinelService
+
+runner = CliRunner()
+NS = "sha256:receipt-cli-ns"
+
+
+def _seed(store: Path, *, title: str = "Add rate limit to login") -> None:
+    service = SentinelService(store)
+    service.record_event(
+        {
+            "event_id": "evt_usage_s1",
+            "created_at": 100.0,
+            "source": "claude-code-local-session-import",
+            "event_type": "model_usage",
+            "run_id": None,
+            "provider": "claude-code",
+            "model": "claude-opus-4-8",
+            "estimated_input_tokens": 100,
+            "estimated_output_tokens": 25,
+            "estimated_cost_usd": 0.5,
+            "usage_confidence": "client_reported",
+            "cost_confidence": "estimated_from_tokens",
+            "cost_basis": "pricing_table",
+            "metadata": {
+                "usage_source": "local_client_session_store",
+                "usage_provenance": "agent_sentinel_local_usage_import",
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "cached_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "project_dir": "/tmp/project",
+                "started_at": 100.0,
+                "updated_at": 100.0,
+                "session_namespace_fingerprint": NS,
+                "identity_scope_state": "explicit",
+                "source_namespace_fingerprint": NS,
+            },
+        },
+        trusted_usage_import=True,
+    )
+    service.record_event(
+        {
+            "event_id": "evt_section_s1",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "section_completed",
+            "run_id": None,
+            "metadata": {
+                "sentinel_semantic_kind": "section",
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "client_context_keys_authored": ["client_session_id"],
+                "project_dir": "/tmp/project",
+                "session_namespace_fingerprint": NS,
+                "identity_scope_state": "explicit",
+                "section_id": "sec-1",
+                "section_status": "completed",
+                "section_title": title,
+                "objective": title,
+                "kind": "implementation",
+                "files": ["src/login.py"],
+            },
+        }
+    )
+
+
+def _add_section(store: Path, *, section_id: str, status: str, at: float) -> None:
+    SentinelService(store).record_event(
+        {
+            "event_id": f"evt_{section_id}",
+            "created_at": at,
+            "source": "claude-code",
+            "event_type": f"section_{status}",
+            "run_id": None,
+            "metadata": {
+                "sentinel_semantic_kind": "section",
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "client_context_keys_authored": ["client_session_id"],
+                "project_dir": "/tmp/project",
+                "session_namespace_fingerprint": NS,
+                "identity_scope_state": "explicit",
+                "section_id": section_id,
+                "section_status": status,
+                "section_title": "handoff task",
+                "objective": "handoff task",
+                "kind": "implementation",
+            },
+        }
+    )
+
+
+def test_receipts_show_handoff_marker_beside_a_hard_problem(tmp_path: Path) -> None:
+    # End-to-end: a blocked step + a later handoff → the decision word is the hard
+    # problem (BLOCKED) while the deliberate stop rides a parallel marker in both
+    # the list and the detail. This is the dogfood bug the change fixes.
+    _seed(tmp_path)  # session s1 + one completed section
+    _add_section(tmp_path, section_id="sec-blocked", status="blocked", at=150.0)
+    _add_section(tmp_path, section_id="sec-handoff", status="handed_off", at=200.0)
+
+    listing = runner.invoke(app, ["receipts", "--store-dir", str(tmp_path)])
+    assert listing.exit_code == 0, listing.output
+    assert "handed off" in listing.output.lower()
+
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "BLOCKED" in detail.output  # the hard problem is the decision word
+    assert "Handed off" in detail.output  # the parallel marker is still shown
+
+
+def test_receipts_pure_handoff_shows_no_duplicate_marker(tmp_path: Path) -> None:
+    # Invariant #4 end-to-end: a cleanly handed-off task's decision word IS
+    # handed_off, so the parallel "↗ handed off" marker must be suppressed — the
+    # handoff is never stated twice. (Only the completed + handed_off sections;
+    # no open successor, so the decision word is handed_off.)
+    _seed(tmp_path)  # session s1 + one completed section
+    _add_section(tmp_path, section_id="sec-handoff", status="handed_off", at=200.0)
+
+    listing = runner.invoke(app, ["receipts", "--store-dir", str(tmp_path)])
+    assert listing.exit_code == 0, listing.output
+    assert "handed_off" in listing.output  # the decision word itself
+    assert "↗" not in listing.output  # but NOT the parallel marker glyph
+
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "HANDED_OFF" in detail.output
+    assert "Lifecycle" not in detail.output  # no duplicate marker row
+
+
+def test_receipts_list_hides_marker_for_a_resumed_task(tmp_path: Path) -> None:
+    # Invariant #3 end-to-end on the list surface: a task handed off then resumed
+    # (a later open step) must show NO handoff marker anywhere — the exact stale-
+    # marker failure the recency guard prevents.
+    _seed(tmp_path)  # session s1 + one completed section
+    _add_section(tmp_path, section_id="sec-handoff", status="handed_off", at=150.0)
+    _add_section(tmp_path, section_id="sec-open", status="started", at=200.0)
+
+    listing = runner.invoke(app, ["receipts", "--store-dir", str(tmp_path)])
+    assert listing.exit_code == 0, listing.output
+    assert "↗" not in listing.output  # no stale handoff marker
+
+
+def test_receipt_detail_lists_specific_tool_names(tmp_path: Path) -> None:
+    # End-to-end: a captured tool_activity event flows through the projection into
+    # the Actions dimension, and the detail shows the SPECIFIC tools (most-used
+    # first), not merely the coarse category counts.
+    _seed(tmp_path)  # session s1
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "toolact:s1-names",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "tool_activity_observed",
+            "run_id": None,
+            "metadata": {
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "sentinel_semantic_kind": "tool_activity",
+                "tool_category_counts": {"execute": 3, "mcp": 1},
+                "tool_names": [{"name": "Bash", "count": 3}, {"name": "mcp__acme__deploy", "count": 1}],
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "tools:" in detail.output
+    assert "Bash×3" in detail.output
+    assert "mcp__acme__deploy×1" in detail.output
+
+
+def test_credential_shaped_tool_name_survives_redaction(tmp_path: Path) -> None:
+    # Connector names are user-controlled and some look credential-ish
+    # (mcp__vault__get_token). Because names ride as list VALUES (not dict keys),
+    # the store's secret redaction must NOT blank them out — the exact tools an
+    # operator most wants to see must reach the Receipt, not vanish silently.
+    _seed(tmp_path)
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "toolact:s1-secret",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "tool_activity_observed",
+            "run_id": None,
+            "metadata": {
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "sentinel_semantic_kind": "tool_activity",
+                "tool_category_counts": {"mcp": 4},
+                "tool_names": [{"name": "mcp__vault__get_token", "count": 4}],
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "mcp__vault__get_token×4" in detail.output
+    assert "REDACTED" not in detail.output
+
+
+def test_receipt_detail_escapes_markup_in_tool_names(tmp_path: Path) -> None:
+    # Tool names are user-controlled; a bracket-tag connector name must render
+    # literally, never be interpreted as markup or crash.
+    _seed(tmp_path)
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "toolact:s1-markup",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "tool_activity_observed",
+            "run_id": None,
+            "metadata": {
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "sentinel_semantic_kind": "tool_activity",
+                "tool_category_counts": {"mcp": 1},
+                "tool_names": [{"name": "mcp__[bold]x[/bold]__y", "count": 1}],
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "mcp__[bold]x[/bold]__y×1" in detail.output  # literal, not interpreted
+
+
+def test_receipt_detail_discloses_tool_name_overflow(tmp_path: Path) -> None:
+    # >RECEIPT_TOOL_NAMES_PREVIEW distinct tools: the detail shows the top slice
+    # and DISCLOSES the remainder at render time, never silently truncating.
+    from agentacct.receipt import RECEIPT_TOOL_NAMES_PREVIEW
+
+    n = RECEIPT_TOOL_NAMES_PREVIEW + 4
+    names = [{"name": f"tool_{i:02d}", "count": n - i} for i in range(n)]
+    _seed(tmp_path)
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "toolact:s1-many",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "tool_activity_observed",
+            "run_id": None,
+            "metadata": {
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "sentinel_semantic_kind": "tool_activity",
+                "tool_category_counts": {"execute": 1},
+                "tool_names": names,
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "tool_00×" in detail.output  # highest count shown
+    assert "tool_09×" in detail.output  # 10th shown (cap 10)
+    assert "tool_10×" not in detail.output  # 11th beyond the cap
+    assert "… +4 more" in detail.output  # overflow disclosed
+
+
+def _record_session_end(store: Path, *, session_id: str, at: float, reason: str = "logout") -> None:
+    SentinelService(store).record_event(
+        {
+            "event_id": f"sessend:{session_id}:{int(at)}",
+            "created_at": at,
+            "source": "claude-code",
+            "event_type": "session_end_observed",
+            "run_id": None,
+            "metadata": {
+                "client": "claude-code",
+                "client_session_id": session_id,
+                "ended_at": at,
+                "reason": reason,
+                "sentinel_semantic_kind": "session_lifecycle",
+            },
+        }
+    )
+
+
+def test_open_section_in_an_ended_session_reads_ended_open_end_to_end(tmp_path: Path) -> None:
+    # End-to-end: a started (open) section whose session then ends (an ambient
+    # session_end_observed event) flows through the store projection — the work
+    # ledger stamps session_ended_at, and the reducer infers ``ended_open``
+    # instead of a perpetual ``in_progress``. This is the dogfood gap the feature
+    # closes: the normal end of a session (agent stops without a terminal record).
+    _seed(tmp_path)  # session s1 + one completed section
+    _add_section(tmp_path, section_id="sec-open", status="started", at=150.0)
+    # The section events are stamped with the store's record time; the SessionEnd
+    # fires AFTER them (its real time.time()), so use a timestamp comfortably after
+    # the record time to express "the session ended after this step's last work".
+    _record_session_end(tmp_path, session_id="s1", at=4_000_000_000.0)
+
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    receipt = json.loads(
+        runner.invoke(app, ["receipt", task_id, "--json", "--store-dir", str(tmp_path)]).output
+    )
+    decision = receipt["axes"]["decision_status"]
+    assert decision["key"] == "ended_open"
+    assert decision["asserted_by"] == "inferred"  # not the agent's word
+
+
+def test_session_end_cli_command_is_fire_and_forget(tmp_path: Path) -> None:
+    # Invariant: the SessionEnd hook path always emits {} and exits 0 — never a
+    # decision, never a non-zero exit — for both well-formed and malformed stdin.
+    ok = runner.invoke(
+        app,
+        ["hooks", "claude-code", "session-end", "--store-dir", str(tmp_path)],
+        input=json.dumps({"hook_event_name": "SessionEnd", "session_id": "s1", "reason": "logout"}),
+    )
+    assert ok.exit_code == 0 and ok.output.strip() == "{}"
+    bad = runner.invoke(
+        app,
+        ["hooks", "claude-code", "session-end", "--store-dir", str(tmp_path)],
+        input="not json at all",
+    )
+    assert bad.exit_code == 0 and bad.output.strip() == "{}"
+
+
+def test_receipts_list_json(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    result = runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema"] == RECEIPT_SCHEMA_VERSION
+    assert len(payload["tasks"]) == 1
+    assert payload["tasks"][0]["task_id"].startswith("task_")
+
+
+def test_receipt_detail_json_has_all_eight_dimensions(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    listing = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )
+    task_id = listing["tasks"][0]["task_id"]
+    result = runner.invoke(app, ["receipt", task_id, "--json", "--store-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    receipt = json.loads(result.output)
+    assert receipt["schema_version"] == RECEIPT_SCHEMA_VERSION
+    assert set(receipt["dimensions"]) == {
+        "task",
+        "actors",
+        "actions",
+        "cost",
+        "evidence",
+        "outcome",
+        "gaps",
+        "provenance",
+    }
+    assert receipt["dimensions"]["cost"]["cost_basis"] == "pricing_table"
+
+
+def test_receipt_text_render_is_scannable(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    result = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    for marker in ("Work Receipt", "Decision status", "Evidence coverage", "Provenance"):
+        assert marker in result.output
+    # The evidence line is a coverage RATIO, not a categorical grade word.
+    assert "unchecked" in result.output or "checked" in result.output
+
+
+def test_receipt_detail_discloses_touched_files_overflow(tmp_path: Path) -> None:
+    # >12 touched files: the CLI shows the 12-path preview and DISCLOSES the
+    # remainder ("… +N more"), never silently truncating — exercised at the
+    # acceptance layer, not just the shared unit helper.
+    files = [f"src/f{i:02d}.py" for i in range(15)]
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "evt_sec_many",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "section_completed",
+            "run_id": None,
+            "metadata": {
+                "sentinel_semantic_kind": "section",
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "client_context_keys_authored": ["client_session_id"],
+                "project_dir": "/tmp/project",
+                "session_namespace_fingerprint": NS,
+                "identity_scope_state": "explicit",
+                "section_id": "sec-many",
+                "section_status": "completed",
+                "section_title": "t",
+                "objective": "t",
+                "kind": "implementation",
+                "files": files,
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "src/f11.py" in detail.output  # 12th path (index 11) is shown
+    assert "src/f12.py" not in detail.output  # 13th is beyond the cap
+    assert "… +3 more" in detail.output  # overflow disclosed
+
+
+def test_receipt_detail_lists_touched_file_paths(tmp_path: Path) -> None:
+    # The seeded section records files=["src/login.py"]; the detail must now show
+    # the actual path, not merely "touched 1 file(s)".
+    _seed(tmp_path)
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "src/login.py" in detail.output
+
+
+def test_receipt_detail_escapes_markup_in_touched_paths(tmp_path: Path) -> None:
+    # File paths are user-controlled; a bracket-tag path must render literally,
+    # never interpreted (no MarkupError, no silent tag drop / injection).
+    SentinelService(tmp_path).record_event(
+        {
+            "event_id": "evt_sec_markup",
+            "created_at": 100.0,
+            "source": "claude-code",
+            "event_type": "section_completed",
+            "run_id": None,
+            "metadata": {
+                "sentinel_semantic_kind": "section",
+                "client": "claude-code",
+                "client_session_id": "s1",
+                "client_context_keys_authored": ["client_session_id"],
+                "project_dir": "/tmp/project",
+                "session_namespace_fingerprint": NS,
+                "identity_scope_state": "explicit",
+                "section_id": "sec-markup",
+                "section_status": "completed",
+                "section_title": "t",
+                "objective": "t",
+                "kind": "implementation",
+                "files": ["src/[red]evil[/red].py"],
+            },
+        }
+    )
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    assert "[red]evil[/red].py" in detail.output  # literal, not interpreted away
+
+
+def test_receipt_text_survives_rich_markup_in_recorded_titles(tmp_path: Path) -> None:
+    # Agent-recorded titles/objectives are arbitrary text; a bracket-tag title
+    # must never crash the render (MarkupError) or be silently reinterpreted.
+    _seed(tmp_path, title="cleanup [/] wip [red]danger[/red]")
+    listing = runner.invoke(app, ["receipts", "--store-dir", str(tmp_path)])
+    assert listing.exit_code == 0, listing.output
+    task_id = json.loads(
+        runner.invoke(app, ["receipts", "--json", "--store-dir", str(tmp_path)]).output
+    )["tasks"][0]["task_id"]
+    detail = runner.invoke(app, ["receipt", task_id, "--store-dir", str(tmp_path)])
+    assert detail.exit_code == 0, detail.output
+    # The literal bracket text is preserved (escaped), not interpreted away.
+    assert "[/]" in detail.output
+
+
+def test_receipt_unknown_task_exits_nonzero(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    result = runner.invoke(app, ["receipt", "task_deadbeef", "--store-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "No Task matches" in result.output

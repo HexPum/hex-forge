@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+export PYTHONDONTWRITEBYTECODE=1
+
+# A full suite on a live box must never outrank the person's sessions, the
+# picker, or the collectors, 2,619 tests at normal priority pushed the load
+# to 12 and starved interactive use on 2026-08-17. Lowest scheduling priority
+# and idle IO for this process and everything it starts; harmless where the
+# tools are missing.
+#
+# NOT on a CI runner. There the suite is the only thing running and there is
+# nobody to yield to, so lowering its own priority only starves the pty tests:
+# the picker under test loses its scheduling slice mid-read and a fixture
+# waiting on a repaint gives up on a picker that was behaving correctly. That
+# is measured, not supposed, under one identical load,
+# test_help_and_more_remain_modal_across_refresh_intervals passed 3 of 4 runs
+# at normal priority and 0 of 4 reniced, and the ubuntu-24.04/3.10 cell went
+# from five straight green runs to failing every run from the commit that
+# added these two lines (42d5946) onward.
+if [[ ${GITHUB_ACTIONS:-} != true ]]; then
+  renice -n 15 -p $$ >/dev/null 2>&1 || true
+  ionice -c 3 -p $$ >/dev/null 2>&1 || true
+fi
+
+# The suite must not inherit the operator's window, and must not inherit a
+# kill switch their shell happened to export either. tests/__init__.py pins
+# this for every entry point, including a bare
+# `python3 -m unittest tests.test_inventory`; the same clearing happens here so
+# it also covers whatever this script starts outside Python. An exported
+# COLUMNS would answer shutil.get_terminal_size before the pin is reached, and
+# a set SESSION_KIT_NO_COLOR/NO_COLOR is a disabled live channel that `sp
+# doctor` reports and tests/test_install.py asserts against. Read
+# pin_terminal() in tests/__init__.py before changing either. A test that wants
+# a width, or wants colour, still sets it for itself and still wins.
+unset COLUMNS LINES SESSION_KIT_NO_COLOR NO_COLOR
+
+# An interrupted run leaves its sandbox in the repository, and any real provider
+# CLI it started inside that sandbox keeps running -- one pair was found alive a
+# day and twenty hours later. Clear both before starting, never anything younger
+# than two hours, so a run in flight is untouched.
+python3 "$repo/tests/sweep_sandboxes.py" || true
+
+# SESSION_KIT_TEST_EXEC_ROOT is deliberately NOT set here. The fixtures honour
+# it (sandboxes move out of the repository, which fixes sandbox litter and the
+# AF_UNIX path-length overflow on deep checkouts), but setting it also flips
+# every pty fixture onto its exec-via-bash branch, a different invocation
+# path than the one CI has always tested, and one that proved timing-fragile
+# on hosted runners. Export it yourself for local runs from a long worktree.
+
+# One process per module, several at a time, when asked for. Unset or 1 keeps
+# the single discovery run this has always been, so nothing changes for anyone
+# who does not opt in. The suite spends most of its wall clock asleep in a pty
+# waiting for a picker to repaint, so the workers cost far less CPU than the
+# clock they save: 4 workers finish the same 2,728 tests in well under half the
+# time, on four processors as readily as on thirty-two.
+workers=${SESSION_KIT_TEST_WORKERS:-1}
+[[ $workers =~ ^[0-9]+$ ]] || workers=1
+if (( workers > 1 )); then
+  suite=(python3 "$repo/tests/shard.py" --workers "$workers")
+else
+  suite=(python3 -m unittest discover -s "$repo/tests" -t "$repo" -v)
+fi
+
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  log=$(mktemp "${RUNNER_TEMP:-/tmp}/session-kit-tests.log.XXXXXX")
+  set +e
+  "${suite[@]}" 2>&1 | tee "$log"
+  status=${PIPESTATUS[0]}
+  set -e
+  if (( status != 0 )); then
+    python3 - "$log" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+separator = "\n" + "=" * 70 + "\n"
+start = text.rfind(separator)
+tail = text[start if start >= 0 else -3500 :][-3500:]
+escaped = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+print(f"::error title=Session Kit test failure::{escaped}")
+PY
+  fi
+  exit "$status"
+fi
+
+exec "${suite[@]}"

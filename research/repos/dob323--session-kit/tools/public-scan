@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Scan a public tree, and optionally its Git history, without printing secrets."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+
+
+TEXT_LIMIT = 4 * 1024 * 1024
+IGNORED_PARTS = {".git", ".mypy_cache", ".ruff_cache", "__pycache__"}
+IGNORED_NAMES = {".coverage"}
+SECRETS = {
+    "private key": re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    ),
+    "GitHub token": re.compile(
+        r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b"
+    ),
+    "GitLab token": re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    "AWS access key": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    "Google API key": re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    "OpenAI key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "Anthropic key": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+    "Slack token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    "Stripe live key": re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"),
+    "npm token": re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
+}
+# Repository-specific words are stored only as one-way digests. The scanner
+# remains safe to publish while still rejecting those words in release trees.
+# Personal names of the maintainer or operators belong here too: shipped files
+# name roles ("the operator", "the maintainer"), never people.
+PRIVATE_TOKEN_DIGESTS = frozenset(
+    {
+        "bcee5f794de98e5f990f21d817f6340df82a99bdcf3f7574f1adbf81be1741d2",
+        "e7c57b9c0eb6672cccff89401253bb0426b7f6a5d856c59c456885550f550128",
+        "9856a5635d21fe7ec66370d38d9326517935b01abae243723ec0d3b1ce610c63",
+        "9fcc02aea1ee9a3091972d30ea9054e0d593501ccb26d21c6c0332121dfa888c",
+        "72615b744fff4e9baeddb92066417fd08f60c8ebbdab199442069dfcd3c571ee",
+        # Private account aliases and handles. NOTE: the public GitHub
+        # org slug is deliberately NOT listed - it is meant to ship.
+        "e407d44798fe8871fc0e252120f886ccc8eed386ff61ac662a7fafe65bf625ff",
+        "dc0215a3b20331be68e97be4071b9f8612958aaeb9ad61a9111b7cd2a8810e1d",
+        # Personal-name tokens (see the maintainer rule in CONTRIBUTING.md).
+        "ec4f2dbb3b140095550c9afbbb69b5d6fd9e814b9da82fad0b34e9fcbe56f1cb",
+        "0b135e8de8f42b4baddb5e580400b8c2dc56f9204758314c2be7019aa9d8d98a",
+        # Neutral test-only marker.
+        "9244bfa2efb5ae19b6f84f62dc79582ad52a25a14f7e904e9c39e739360a7cff",
+    }
+)
+# Every digest a path has ever legitimately shipped with: the working tree
+# must match one, and superseded versions stay reachable in public history.
+APPROVED_BINARY_SHA256 = {
+    "docs/assets/session-kit-picker.png": (
+        # v0.4.0 render, superseded 2026-08-17.
+        "6885c0c477fac8b1811c5a29f1f70063b5f6333cfb3c8d3c96b62dc82c0d7d0b",
+        # 2026-08-17 render: live states, accounts, and models in the demo.
+        "2e1e5693c15bea25fa27ddd0b07fe4329cabb75c2831a21d38cea36216cdffe2",
+        # 2026-08-17 second render: every run pinned to the character grid so
+        # bold glyphs cannot drift the columns.
+        "5cb56b210644526e5cc54534248a922ae2e2dca36c0ef717c211caa9f5a83ca8",
+    ),
+    # Shipped publicly with v0.4.0, later trimmed from the tree; the blob
+    # stays reachable in public history. Reviewed 2026-08-17: a dashboard
+    # screenshot, nothing private.
+    # The Reddit launch hero: a designed banner around a picker mock. Added
+    # 2026-08-17 as the README's lead image.
+    "docs/assets/session-kit-hero.png": (
+        "6323318e29c1d7ee9c5ab2d1e766107fa8303b742ebfa86d6621b846ecf14841",
+    ),
+    "docs/assets/session-kit-dashboard.png": (
+        "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db",
+    ),
+    # --------------------------------------------------------------- history
+    # README redesign, 2026-08-17. Every terminal region in these four is the
+    # deterministic tools/render-readme-picker output, whose demo data is
+    # neutral by construction: aliases "personal" and "work", demo session
+    # ids, and a "session kit" title bar rather than a real user@host. An
+    # earlier cut of this artwork composited a live capture and carried a
+    # real account alias, host name, and personal name; it was rejected and
+    # never entered the tree. Reviewed at 3x zoom before approval: nothing
+    # private in any of the four.
+    "docs/assets/readme/hero.png": (
+        "e5a5031889808fce8269ac21e254e7c92003bb4951075ae6ecac602bf0869a2b",
+    ),
+    # Callout leader lines stop at the capture edge; an earlier cut drew them
+    # across it and struck out the labels they pointed at.
+    "docs/assets/readme/picker-anatomy.png": (
+        "a25a27a9b35b9d7c2d130f1fc5f52f3afe487024409229e93d61e42c7756a59f",
+        # 2026-08-17 recomposition: leader lines dropped entirely for a labelled
+        # row strip and four panels, so nothing has to reach into the capture at
+        # all. The picker render is pasted unscaled-in-aspect and verified
+        # pixel-identical to tools/render-readme-picker output before approval.
+        "2819ce4a9fc8a8d6ecace378d9f7dbbc24dfb3d3074118f6a836cf3d174f95b6",
+        # 2026-08-17, third cut: an annotated picker rather than an explainer.
+        # The capture is pasted at native size and is byte-identical to the
+        # render; every label sits outside it and its leader stops short of the
+        # border, so the crop of this figure and the picker render compare
+        # equal pixel for pixel. Includes the prompt line the renderer used to
+        # trim, and the ↵ and ❯ glyphs now that the host has a font with them.
+        "e637186dfc12ad5e631074fdc4b6edb6fc096d90d5abad151287dc16db58dfc6",
+        # 2026-08-17, final: no labels at all. The picker page speaks for
+        # itself, so the figure is the render and nothing else.
+        "929e3289e14ae3313d3e2ce39c5155b5a782a947bfc0103af2ad641f4e098ef8",
+        # 2026-08-17: the picker as it actually appears on screen, no window
+        # chrome, no traffic lights, terminal padding only. The framed version
+        # looked like a product shot of a terminal rather than the terminal.
+        "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
+        # 2026-08-17 final: a terminal window with the picker in it, frame,
+        # neutral ~ title, and a cursor on the prompt so the command line
+        # reads as one. Matches what the picker looks like on screen.
+        "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
+        # 2026-08-17, re-rendered for v0.4.2 after pinned projects stepped
+        # out of the release: neither the command bar nor the key panel
+        # shows a `p` the shipped version does not have. Reviewed before
+        # approval, the same neutral demo data (personal/work aliases,
+        # demo session numbers, a "session kit" title bar), nothing private.
+        "11967030cc802fac34a0288e630f13bc14d6ff0780ee7ce5654339dae7956de1",
+    ),
+    # The bare picker render, identical to the docs/assets/session-kit-picker
+    # blob above because both come from the same deterministic tool.
+    "docs/assets/readme/picker-home.png": (
+        "5cb56b210644526e5cc54534248a922ae2e2dca36c0ef717c211caa9f5a83ca8",
+        # 2026-08-17 re-render: keeps the prompt line, and the ↵ and ❯ glyphs
+        # resolve now that the render host has a font carrying them. Both used
+        # to reach the README as missing-glyph boxes.
+        "f41b7567f281bf4d0548769442673c4e2908ba762ae7edd92f5b840a895d9c95",
+        # 2026-08-17: the picker as it actually appears on screen, no window
+        # chrome, no traffic lights, terminal padding only. The framed version
+        # looked like a product shot of a terminal rather than the terminal.
+        "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
+        # 2026-08-17 final: a terminal window with the picker in it, frame,
+        # neutral ~ title, and a cursor on the prompt so the command line
+        # reads as one. Matches what the picker looks like on screen.
+        "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
+    ),
+    # ---------------------------------------------------------------- current
+    # The README's four figures, 2026-08-18. Every terminal region in them is
+    # tools/render-readme-picker output, captured from the real picker through
+    # the login fixture, whose demo data is neutral by construction: aliases
+    # "personal" and "work", demo session ids, and a "session kit" title bar
+    # rather than a real user@host. The render is byte-deterministic, two runs
+    # of the tools produce identical files, so a digest here changes only when
+    # the artwork or the picker does. Reviewed at 3x zoom: nothing private.
+    "docs/assets/readme/picker.png": (
+        "ecd92cfbb801252cc6b6a8036484e617bbb6f4eb9c25d48ceee035ef2bb1cca8",
+    ),
+    # The needs-you screen behind `a`, captured in the same picker run as the
+    # list above so the two cannot describe different inventories.
+    "docs/assets/readme/needs-you.png": (
+        "3df51a0db5f8fb1f095b5e21e788f299ac320d95ab7aab4b54894fdb75286afe",
+    ),
+    # Laid-out diagrams with no capture in them; text only, all of it written
+    # for the page.
+    "docs/assets/readme/how-it-works.png": (
+        # Advertised shell sessions as a third kind of managed session.
+        "05e0ec07f0c0ebbfeac344811aad70ad4ad04ca7fe19f95fb8fb28da97b7b009",
+        # 2026-08-18 render, reviewed: panel three now reads "Claude Code or
+        # Codex runs inside it", matching a page that no longer offers shells
+        # as a session type. Panel one still says "an ordinary shell", which is
+        # the person's own terminal and a different thing entirely. Text only,
+        # no capture, nothing private; layout unchanged.
+        "09531a327b2f22f2d29f5db9e408cf0bb4433a7baa702fe916d9812c39a9a5a8",
+    ),
+    "docs/assets/readme/safety-model.png": (
+        "872acd2a47dfe8a238eddf389c3efcab50d970a2c5496084f6b6477264ab3293",
+    ),
+    # GitHub social preview: 1280x640, uploaded through repository settings,
+    # versioned here so the share artwork travels with the rest.
+    "docs/assets/readme/social-preview.png": (
+        # 2026-08-17 card, superseded: it led with the old positioning.
+        "562bf99a1b7728b670092b7a6d0bd26016d28c4ecba07f3bc8ea18d0538e3349",
+        # 2026-08-18: tools/render-readme-social, headline plus the real
+        # needs-you screen.
+        "d16d0c508e109e5a7a6efc5d186e7039696e2c2f0d5495acb76317fc331f217e",
+        # 2026-08-18 re-render, reviewed: the supported line no longer offers
+        # "shells". This card is what every shared link shows, so it was the
+        # last place still advertising a session type the page has dropped.
+        # Same layout, same captured needs-you screen, nothing private.
+        "b89ffe3efb183e1fcb71fe70f77c96c9a3a112b0a940c742ecb8818cced2941a",
+    ),
+}
+
+
+def scan_text(
+    label: str,
+    payload: bytes,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    if len(payload) > TEXT_LIMIT:
+        return [f"{label}: file exceeds scan limit"]
+    if b"\0" in payload:
+        return [f"{label}: binary file is not allowed"]
+    text = payload.decode("utf-8", "replace")
+    failures = [
+        f"{label}: {name}" for name, pattern in patterns.items() if pattern.search(text)
+    ]
+    if private_markers:
+        for token in re.findall(r"[A-Za-z0-9_]+", text.casefold()):
+            # A snake_case identifier must not smuggle a private word past the
+            # check, so every underscore-separated part is tested as well as
+            # the whole token.
+            parts = {token, *token.split("_")}
+            if any(
+                hashlib.sha256(part.encode("utf-8")).hexdigest()
+                in PRIVATE_TOKEN_DIGESTS
+                for part in parts
+                if part
+            ):
+                failures.append(f"{label}{MARKER_FAILURE}")
+                break
+    return failures
+
+
+def scan_payload(
+    label: str,
+    path: str,
+    payload: bytes,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    expected_digests = APPROVED_BINARY_SHA256.get(path)
+    if expected_digests is not None:
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if actual_digest not in expected_digests:
+            return [f"{label}: approved binary digest mismatch"]
+        return []
+    return scan_text(label, payload, patterns, private_markers=private_markers)
+
+
+def scan_tree(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    failures: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if (
+            any(part in IGNORED_PARTS for part in path.parts)
+            or path.name in IGNORED_NAMES
+            or path.suffix in {".pyc", ".pyo"}
+        ):
+            continue
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            failures.append(f"{relative}: symlink is not allowed")
+            continue
+        if path.is_dir():
+            continue
+        failures.extend(
+            scan_payload(
+                str(relative),
+                relative.as_posix(),
+                path.read_bytes(),
+                patterns,
+                private_markers=private_markers,
+            )
+        )
+    return failures
+
+
+MARKER_FAILURE = ": private marker"
+BASELINE_ENTRY = re.compile(r"^([0-9a-f]{40})(?:\s+(\S.*))?$")
+
+
+class BaselineError(Exception):
+    """The grandfathered-history list could not be read exactly."""
+
+
+def load_baseline(path: Path) -> frozenset[str]:
+    """Read the reviewed history objects the private-marker rule may skip.
+
+    An entry is a blob id or a commit id; both are 40 hex digits and both are
+    a digest of the thing they exempt, so neither can be stretched to cover
+    anything but the bytes that were reviewed.
+
+    Every failure mode here is fatal on purpose. A baseline that silently
+    parses to nothing would turn the history scan back into a pass with no
+    evidence behind it, which is the one outcome a fail-closed check must
+    never produce.
+    """
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BaselineError(f"baseline is unreadable: {exc}") from exc
+    objects: set[str] = set()
+    for number, line in enumerate(payload.splitlines(), 1):
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        match = BASELINE_ENTRY.fullmatch(entry)
+        if match is None:
+            raise BaselineError(f"malformed baseline line {number}: {line!r}")
+        object_id = match.group(1)
+        if object_id in objects:
+            raise BaselineError(
+                f"duplicate baseline object on line {number}: {object_id}"
+            )
+        objects.add(object_id)
+    if not objects:
+        raise BaselineError("baseline lists no objects")
+    return frozenset(objects)
+
+
+def git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+
+
+def scan_history(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+    baseline: frozenset[str] = frozenset(),
+    applied: set[str] | None = None,
+) -> list[str]:
+    try:
+        rows = git(root, "rev-list", "--objects", "--all").stdout.splitlines()
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "not a Git repository"
+        return [f"Git history unavailable: {detail}"]
+
+    failures: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        object_id, _, path = row.partition(" ")
+        if object_id in seen:
+            continue
+        seen.add(object_id)
+        if git(root, "cat-file", "-t", object_id).stdout.strip() != "blob":
+            continue
+        size = int(git(root, "cat-file", "-s", object_id).stdout.strip())
+        label = f"history {object_id[:12]}"
+        if path:
+            label += f" ({path})"
+        if size > TEXT_LIMIT:
+            failures.append(f"{label}: file exceeds scan limit")
+            continue
+        payload = git(root, "cat-file", "blob", object_id, text=False).stdout
+        found = scan_payload(
+            label,
+            path,
+            payload,
+            patterns,
+            private_markers=private_markers,
+        )
+        if object_id in baseline:
+            # A baselined blob is exempt from the private-marker rule and from
+            # nothing else. Secrets still fail, so listing a blob can never be
+            # a way to publish a leaked credential: the exemption is keyed to
+            # the exact content, and edited content is a different object.
+            excused = [item for item in found if item.endswith(MARKER_FAILURE)]
+            if excused and applied is not None:
+                applied.add(object_id)
+            found = [item for item in found if not item.endswith(MARKER_FAILURE)]
+        failures.extend(found)
+    failures.extend(
+        scan_commit_messages(
+            root,
+            patterns,
+            private_markers=private_markers,
+            baseline=baseline,
+            applied=applied,
+        )
+    )
+    return failures
+
+
+def scan_commit_messages(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+    baseline: frozenset[str] = frozenset(),
+    applied: set[str] | None = None,
+) -> list[str]:
+    """A commit message is published text, and it was not being read.
+
+    The object walk above opens blobs and nothing else, so every rule this
+    scanner enforces stopped at the file boundary. A name, a token, or a
+    private path written into a commit message shipped with nothing here
+    objecting, even where the same word in a tracked file would have failed.
+
+    A message cannot be corrected without rewriting history, and rewriting a
+    published history breaks every provenance chain that points into it. So
+    this is a gate on what is about to be published rather than a cleanup of
+    what already was: reviewed messages that predate the gate are baselined by
+    commit id, exactly as reviewed blobs are.
+    """
+    # Record and field separators, not NUL: scan_text treats a NUL byte as
+    # proof of a binary file and would refuse every message it was handed.
+    try:
+        raw = git(root, "log", "--format=%H%x1f%B%x1e", "--all").stdout
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "not a Git repository"
+        return [f"Git history unavailable: {detail}"]
+
+    failures: list[str] = []
+    for record in raw.split("\x1e"):
+        record = record.strip("\n")
+        if not record:
+            continue
+        commit, _, message = record.partition("\x1f")
+        found = scan_text(
+            f"commit {commit[:12]} message",
+            message.encode("utf-8"),
+            patterns,
+            private_markers=private_markers,
+        )
+        if commit in baseline:
+            # Same bargain the blob baseline strikes: exempt from the
+            # private-marker rule and from nothing else. A credential or key
+            # in a listed message still fails, and the exemption is keyed to
+            # the commit id, which no later message can inherit.
+            excused = [item for item in found if item.endswith(MARKER_FAILURE)]
+            if excused and applied is not None:
+                applied.add(commit)
+            found = [item for item in found if not item.endswith(MARKER_FAILURE)]
+        failures.extend(found)
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", default=".", type=Path)
+    parser.add_argument(
+        "--git-history",
+        action="store_true",
+        help="scan every blob and commit message reachable from local Git refs",
+    )
+    parser.add_argument(
+        "--private-markers",
+        action="store_true",
+        help="also reject repository-specific private markers",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help=(
+            "file listing reviewed blobs and commit messages that predate a "
+            "private marker; exempts those exact objects from the "
+            "private-marker rule only"
+        ),
+    )
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if not root.is_dir():
+        parser.error("root must be a directory")
+    baseline: frozenset[str] = frozenset()
+    if args.baseline is not None:
+        if not args.git_history:
+            parser.error("--baseline applies to --git-history scans")
+        try:
+            baseline = load_baseline(args.baseline)
+        except BaselineError as exc:
+            parser.error(str(exc))
+
+    failures = scan_tree(
+        root,
+        SECRETS,
+        private_markers=args.private_markers,
+    )
+    applied: set[str] = set()
+    if args.git_history:
+        failures.extend(
+            scan_history(
+                root,
+                SECRETS,
+                private_markers=args.private_markers,
+                baseline=baseline,
+                applied=applied,
+            )
+        )
+    failures = sorted(set(failures))
+    if failures:
+        print("public scan failed:")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
+    scope = "tree and Git history" if args.git_history else "tree"
+    if baseline:
+        # Say what the baseline actually did here, not how long the list is.
+        # A gap between the two is how a stale entry becomes visible.
+        scope += (
+            f", {len(applied)} of {len(baseline)} baselined history object(s) excused"
+        )
+    print(f"public scan passed ({scope})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

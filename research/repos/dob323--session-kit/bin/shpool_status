@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# One renderer and exact inventory source for the login picker and `sp`.
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
+
+# See bin/session_kit_common: the release directory is read-only, so writing a
+# bytecode cache always fails. This entry point does not source that file, and
+# it runs on every login picker and every `sp` render, so it sets it here too.
+export PYTHONDONTWRITEBYTECODE=1
+
+# Title reconciliation mutates private provider/name state and therefore runs
+# only on refresh paths already documented as state-building. Human listing
+# remains observation-only.
+fill_pending_titles() {
+  python3 "$CORE" automatic-title claude-pending >/dev/null 2>&1 || true
+  python3 "$CORE" automatic-title codex-pending >/dev/null 2>&1 || true
+}
+
+# Which modes touch state and which do not is the question a person actually
+# has here. Listing is observation: it neither fills titles nor writes the
+# cached snapshot. Explicit machine refresh modes retain their documented
+# cache behaviour.
+status_usage() {
+  cat <<'USAGE'
+usage: shpool_status [mode]
+
+Read-only modes -- nothing on disk changes:
+  (no mode)                            the dashboard
+  --rows                               dashboard rows only
+  --strict-json                        live snapshot, strict identity, no write
+  --guard-json                         live snapshot for mutation guards, no write
+  --render-file <snapshot.json> [--rows]
+                                       render a snapshot file that already exists
+  --lookup-file <snapshot.json> <row|shpool-id>
+                                       resolve a selector inside a snapshot file
+  --recovery-pending-list              list pending recovery records
+
+Modes that refresh the cached inventory as they run:
+  --waiting-count                      how many sessions are waiting for you
+  --detail <session-number>            one session in full, for a person
+  --json                               the whole snapshot as JSON
+  --lookup <row|shpool-id>             resolve one selector to its record
+
+Modes that change recovery state:
+  --recovery-pending-ack <source-generation-key> <old-shpool-id> <uuid>
+                                       acknowledge one pending recovery record
+  --recovery-remember-printed <recovery-list.json>
+                                       record what a recovery screen printed
+                                       beside each row, so a word typed later
+                                       can be checked against it
+
+--json, --strict-json, --guard-json, --lookup, and --lookup-file are the
+machine channels and carry identifiers. The dashboard, --rows, and --detail are
+what a person reads, and never print a shpool ID or a provider UUID.
+Statuses: 0 done, 2 wrong arguments, 3 live evidence refused as stale, partial,
+or ambiguous. `sp help exit-codes` documents them all.
+USAGE
+}
+
+case "${1:-}" in
+  "") exec python3 "$CORE" render ;;
+  --rows) exec python3 "$CORE" render --rows ;;
+  --waiting-count) exec python3 "$CORE" waiting-count ;;
+  --json)
+    [[ -z ${2:-} ]] || { status_usage >&2; exit 2; }
+    fill_pending_titles
+    exec python3 "$CORE" snapshot
+    ;;
+  --strict-json) exec python3 "$CORE" snapshot --strict-live --no-write ;;
+  --guard-json) exec python3 "$CORE" snapshot --guard-live --no-write ;;
+  --lookup)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    fill_pending_titles
+    exec python3 "$CORE" lookup "$2"
+    ;;
+  --detail)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" detail "$2"
+    ;;
+  --render-file)
+    [[ -n ${2:-} && ( -z ${3:-} || ${3:-} == --rows ) && -z ${4:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    if [[ ${3:-} == --rows ]]; then
+      exec python3 "$CORE" render --input "$2" --rows
+    fi
+    exec python3 "$CORE" render --input "$2"
+    ;;
+  --lookup-file)
+    [[ -n ${2:-} && -n ${3:-} && -z ${4:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" lookup --input "$2" "$3"
+    ;;
+  --recovery-pending-list)
+    [[ -z ${2:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-pending list
+    ;;
+  --recovery-remember-printed)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-selectors remember --payload "$2"
+    ;;
+  --recovery-pending-ack)
+    [[ -n ${2:-} && -n ${3:-} && -n ${4:-} && -z ${5:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-pending ack "$2" "$3" "$4"
+    ;;
+  -h | --help | help)
+    status_usage
+    exit 0
+    ;;
+  *)
+    status_usage >&2
+    exit 2
+    ;;
+esac

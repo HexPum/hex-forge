@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose an outcome, extension, or compatibility improvement for Better Harness.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us the user or maintainer outcome you want. A rough idea is enough; maintainers can help shape scope and validation.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues for a similar request.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the recurring task, failure, or missing capability.
+      placeholder: I often need to ... but Better Harness currently ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would success look like?
+      description: Describe the visible result without needing to design the implementation.
+      placeholder: I would be able to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Where would this be used?
+      description: Name any affected host, command, Skill, report, docs page, or workflow if you know it.
+      placeholder: Qoder, Cursor, standalone CLI, reports, docs, unsure...
+    validations:
+      required: true
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or evidence
+      description: Add links, screenshots, repeated cases, or a short scenario if available.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: Add constraints, compatibility concerns, alternatives, or willingness to contribute if helpful.
