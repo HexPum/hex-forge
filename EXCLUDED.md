@@ -15,6 +15,7 @@ Consolidated ledger, checked across every topic folder in this repo. **Check her
 | `nexu-io/open-design` | 89k★ in ~4 months (~23.7k/mo), SEO-stuffed description. Part of a larger "open-source Claude Design alternative" cluster (`opencoworkai/open-codesign`, `open-pencil/open-pencil`, `ZSeven-W/openpencil`) that otherwise measures under the ceiling but predates the relevant trending window | trending scan |
 | `cinderline/northcinder` | ~17.9k★/mo, near-zero forks | trending scan |
 | `ccch1mneyyy/dsh-TUI` | ~10.3k★/mo, 0 watchers | trending scan |
+| `leonxlnx/taste-skill` | 78k★ in ~6 months (~13k/mo). Its own description says it's a synthesis of `emilkowalski/skill` + `pbakaus/impeccable` — both kept (see [`design/`](design/)), read directly instead of via this repackaging | similar-repos scan |
 
 **Pattern to watch:** fake-star campaigns increasingly park on the `topic:claude-code` GitHub tag specifically, riding its discoverability.
 

@@ -1,0 +1,23 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# VS Code (optional, if you use it)
+.vscode/
+
+# General backup/temporary files
+*.swp
+*.swo
+*.tmp
+*.log
+
+# Logs folder
+logs/
+.serena/
+.playwright-mcp/
+.opencode/
+
+# Claude Code local configuration
+.claude.json
