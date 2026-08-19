@@ -26,6 +26,10 @@ Read against `keepsake-ui/design/README.md`, `apps/web/lib/dense/theme.ts`, and 
 
 ## Suggested next step, ranked
 
-1. **Write the motion section** — the one gap that's not a judgment call, just missing. Two real transitions (row hover, sidebar collapse) need actual numbers in `design/README.md`.
+1. ~~**Write the motion section**~~ — done 2026-08-19. Turned out the row-hover motion was already implemented (150ms ease on color/background/border/opacity, applied globally in `dense-theme.css`) — just never written into `design/README.md`, so it was undocumented tribal knowledge one CSS-comment deep. Sidebar collapse/expand, on inspection, is a hard swap between two structurally different `<aside>` trees (`DenseSidebar.tsx`), not a width change on one element — animating it is a real restructuring task, documented as an open gap rather than silently taken on as part of "write the motion section."
 2. **Run one outside critique pass** (StyleSeed's `/ss-score` or Hallmark's `audit`) against a built dense-list screen — not to adopt its opinions on shadows/black-point wholesale, but specifically to catch things like #1 that a self-authored doc won't flag on its own.
 3. **Leave the shadow rule and the accent system alone** — both are already more disciplined than what StyleSeed enforces by default.
+
+## Also found, unrelated to motion
+
+- **Sidebar rail width discrepancy.** `design/README.md` specifies the collapsed rail at `width: 58px`; `DenseSidebar.tsx` actually renders it at `w-[40px]`. Not fixed — flagging only, since it's outside what was asked and either the doc or the code is the one that's wrong, not obviously which.
