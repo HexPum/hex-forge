@@ -1,0 +1,116 @@
+name: Sync downstream repos
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to simulate (e.g. v0.12.0)"
+        required: true
+        default: "v0.12.0"
+
+# Cross-repo writes use SKILLS_REPO_PAT / NEXT_REPO_PAT, not GITHUB_TOKEN, so
+# the default token stays read-only.
+permissions:
+  contents: read
+
+jobs:
+  sync-skills:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout dembrandt-skills
+        uses: actions/checkout@v7
+        with:
+          repository: dembrandt/dembrandt-skills
+          token: ${{ secrets.SKILLS_REPO_PAT }}
+          path: dembrandt-skills
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Bump skills version and update SKILL.md
+        env:
+          DEMBRANDT_VERSION: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+        run: |
+          cd dembrandt-skills
+          VERSION="${DEMBRANDT_VERSION#v}"
+          npm version patch --no-git-tag-version
+          find skills -name "SKILL.md" -exec \
+            sed -i "s/dembrandt@[0-9][0-9.]*/dembrandt@${VERSION}/g" {} \;
+
+      - name: Create PR in dembrandt-skills
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SKILLS_REPO_PAT }}
+          path: dembrandt-skills
+          commit-message: "chore: sync with dembrandt ${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          branch: "sync/dembrandt-${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          title: "chore: sync with dembrandt ${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          body: |
+            Automated sync triggered by [dembrandt ${{ github.event.release.tag_name || github.event.inputs.tag }}](${{ github.event.release.html_url || 'manual trigger' }}).
+
+            - Bumped `dembrandt-skills` patch version
+            - Updated CLI version references in skill files
+
+            **⚠ Manual check required before merging**
+            This automation only updates version numbers. If this release added or changed CLI flags, update `skills/extract-design/SKILL.md` manually:
+            - Flags reference table
+            - Anti-Bot section if behavior changed
+
+            See full checklist: [dembrandt/CLAUDE.md](https://github.com/dembrandt/dembrandt/blob/main/CLAUDE.md)
+          labels: automated
+
+  sync-next:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout dembrandt-next
+        uses: actions/checkout@v7
+        with:
+          repository: dembrandt/dembrandt-next
+          token: ${{ secrets.NEXT_REPO_PAT }}
+          path: dembrandt-next
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Update dembrandt version references
+        env:
+          DEMBRANDT_VERSION: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+        run: |
+          cd dembrandt-next
+          VERSION="${DEMBRANDT_VERSION#v}"
+          npm pkg set dependencies.dembrandt="${VERSION}"
+          # Keep package-lock.json in sync with package.json. Without this the
+          # lock still pins the old version and `npm ci` (CI, the drift gate)
+          # fails before anyone can run `npm install`.
+          npm install --package-lock-only
+          # schema.org softwareVersion always tracks the CLI version (deterministic)
+          sed -i "s/\"softwareVersion\": \"[0-9][0-9.]*\"/\"softwareVersion\": \"${VERSION}\"/" app/layout.tsx
+
+      - name: Create PR in dembrandt-next
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.NEXT_REPO_PAT }}
+          path: dembrandt-next
+          commit-message: "chore: bump dembrandt to ${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          branch: "sync/dembrandt-${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          title: "chore: bump dembrandt to ${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          body: |
+            Automated bump triggered by [dembrandt ${{ github.event.release.tag_name || github.event.inputs.tag }}](${{ github.event.release.html_url || 'manual trigger' }}).
+
+            Updates `dembrandt` npm dependency to latest release (package.json + package-lock.json) and bumps `app/layout.tsx` schema.org `softwareVersion`.
+
+            **⚠ Manual check required before merging**
+            This automation bumps the npm version in `package.json` and the schema.org `softwareVersion`. If this release added or changed CLI flags, update these manually before merging:
+            - `app/getting-started/page.tsx` — flags list
+            - `app/blackpaper/page.tsx` — flags list
+            - `app/page.tsx` — landing page flags (`new: true` for new ones)
+            - `lib/app/extract-types.ts` — `ExtractionMeta` if JSON output shape changed
+            - `app/api/extractions/route.ts` — if field access needs updating
+
+            See full checklist: [dembrandt/CLAUDE.md](https://github.com/dembrandt/dembrandt/blob/main/CLAUDE.md)
+          labels: automated

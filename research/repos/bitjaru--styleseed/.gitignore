@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.env
+.env.*
+.lazyweb/
+.local-marketplace/
+
+# Promo & blog (local only)
+showcase/PROMO*.md
+showcase/blog-*.md
