@@ -19,6 +19,12 @@ Reach for this folder when the task is about *running Claude Code itself* better
 | [wesammustafa/Claude-Code-Everything-You-Need-to-Know](https://github.com/wesammustafa/Claude-Code-Everything-You-Need-to-Know) | 2.7k | Practical guide with a runnable `.claude/` directory as a worked example | Want to see the mechanisms below actually wired up, not just described |
 | [shanraisshan/claude-code-best-practice](https://github.com/shanraisshan/claude-code-best-practice) | 65k | Community reference manual + working `.claude/` implementation, auto-updated daily against official docs. *(Vendored copy trimmed — dropped `tips/`, `presentation/`, `!/`, ~60MB of screenshots/video thumbnails, kept the text/config content.)* | Checking whether official Claude Code behavior has drifted from what's documented here |
 
+## Self-authored
+
+| | What it is |
+|---|---|
+| [`agent-team-pipeline/`](agent-team-pipeline/) | A 4-agent plan→code→test→review pipeline (Planner/Coder/Tester/Reviewer), handing off through one shared folder, run via a single `/ship <idea>` command. Read-only Reviewer enforced at the tool-permission level. Built from Claude Code's real primitives + this folder's own patterns below — not vendored from anywhere, no polished existing match was found. |
+
 ## Mechanisms & techniques worth stealing
 
 Extracted from actually reading the four repos above (2026-08-19) — not in [`../MANUAL.md`](../MANUAL.md) yet:
